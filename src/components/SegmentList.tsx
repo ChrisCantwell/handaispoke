@@ -8,8 +8,8 @@ interface SegmentListProps {
   onUpdateSegment: (updated: AudioSegment) => void;
   onAddSegment: (newSeg: AudioSegment) => void;
   onDeleteSegment: (id: string) => void;
-  onPlaySegmentOnly: (start: number, end: number) => void;
-  currentlyAuditioning: { start: number; end: number } | null;
+  onPlaySegmentOnly: (seg: AudioSegment) => void;
+  currentlyAuditioning: { id: string; start: number; end: number } | null;
   onPatchSegment: (seg: AudioSegment) => void;
   onRemovePatch: (seg: AudioSegment) => void;
 }
@@ -78,7 +78,7 @@ export default function SegmentList({
 
   const isCurrentAudition = (seg: AudioSegment) => {
     if (!currentlyAuditioning) return false;
-    return Math.abs(currentlyAuditioning.start - seg.start) < 0.05 && Math.abs(currentlyAuditioning.end - seg.end) < 0.05;
+    return currentlyAuditioning.id === seg.id;
   };
 
   return (
@@ -126,7 +126,7 @@ export default function SegmentList({
                   <div className="flex items-center gap-3">
                     <button
                       id={`audition-btn-${seg.id}`}
-                      onClick={() => onPlaySegmentOnly(seg.start, seg.end)}
+                      onClick={() => onPlaySegmentOnly(seg)}
                       className={`w-8 h-8 rounded-full flex items-center justify-center cursor-pointer transition-all ${
                         isAuditioning
                           ? "bg-emerald-500 text-slate-950 animate-pulse"

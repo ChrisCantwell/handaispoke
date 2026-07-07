@@ -9,6 +9,38 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
+// SERVER LOGS STORAGE
+interface ServerLog {
+  id: string;
+  timestamp: string;
+  level: "info" | "warn" | "error" | "success";
+  category: "api" | "server";
+  message: string;
+  details?: string;
+}
+
+const serverLogsList: ServerLog[] = [];
+
+export function logToServer(level: "info" | "warn" | "error" | "success", category: "api" | "server", message: string, details?: any) {
+  const logEntry: ServerLog = {
+    id: `srv-${Math.random().toString(36).substring(2, 11)}`,
+    timestamp: new Date().toISOString(),
+    level,
+    category,
+    message,
+    details: details ? (typeof details === "object" ? JSON.stringify(details, null, 2) : String(details)) : undefined
+  };
+  serverLogsList.push(logEntry);
+  if (serverLogsList.length > 500) {
+    serverLogsList.shift();
+  }
+  const emoji = level === "success" ? "✅" : level === "warn" ? "⚠️" : level === "error" ? "❌" : "ℹ️";
+  console.log(`${emoji} [${category.toUpperCase()}] ${message}`);
+}
+
+// Log startup action
+logToServer("info", "server", "Vocal Match & Podcast Studio Server initialized");
+
 // Body parsing with large limits for audio data base64 uploads
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
@@ -100,15 +132,19 @@ app.post("/api/analyze-audio", async (req, res) => {
   try {
     const { audio, mimeType, script, chunkStart, chunkEnd } = req.body;
     if (!audio) {
+      logToServer("warn", "api", "Analysis request rejected: Missing 'audio' data.");
       return res.status(400).json({ error: "Missing 'audio' data (base64 string required)." });
     }
     if (!mimeType) {
+      logToServer("warn", "api", "Analysis request rejected: Missing 'mimeType'.");
       return res.status(400).json({ error: "Missing 'mimeType' (e.g., audio/mp3, audio/wav, audio/webm)." });
     }
 
     const ai = getAI();
 
-    console.log(`Analyzing audio with Gemini. MimeType: ${mimeType}, Size: ${Math.round(audio.length / 1024)} KB, Reference Script: ${!!script}, Chunk: ${chunkStart !== undefined ? chunkStart + "s - " + chunkEnd + "s" : "Full"}`);
+    const audioSizeKb = Math.round(audio.length / 1024);
+    const chunkInfo = chunkStart !== undefined ? `${chunkStart.toFixed(1)}s - ${chunkEnd.toFixed(1)}s` : "Full file";
+    logToServer("info", "api", `Audio Analysis Started. MimeType: ${mimeType}, Size: ${audioSizeKb} KB, Script provided: ${!!script}, Interval: ${chunkInfo}`);
 
     let userInstruction = "";
     if (script && typeof script === "string" && script.trim()) {
@@ -188,12 +224,13 @@ app.post("/api/analyze-audio", async (req, res) => {
       throw new Error("No output text received from Gemini API.");
     }
 
-    console.log("Analysis completed successfully.");
     const parsed = JSON.parse(text);
+    const count = parsed.keeps?.length || 0;
+    logToServer("success", "api", `Audio Analysis Successful. Found ${count} non-destructive keep segments to stitch.`);
     return res.json(parsed);
 
   } catch (error: any) {
-    console.error("Error analyzing audio:", error);
+    logToServer("error", "api", `Audio Analysis Failed: ${error.message}`, { stack: error.stack });
     return res.status(500).json({
       error: error.message || "An unexpected error occurred during audio analysis."
     });
@@ -203,17 +240,37 @@ app.post("/api/analyze-audio", async (req, res) => {
 // API endpoint to generate vocal speech patch
 app.post("/api/generate-patch", async (req, res) => {
   try {
-    const { referenceAudio, mimeType, textToSpeak, voicePreset } = req.body;
+    const { referenceAudio, mimeType, textToSpeak, voicePreset, styleGuidelines } = req.body;
     if (!textToSpeak) {
+      logToServer("warn", "api", "Vocal patch generation rejected: Missing 'textToSpeak' input.");
       return res.status(400).json({ error: "Missing 'textToSpeak' input string." });
     }
 
     const ai = getAI();
-    console.log(`Generating speech patch with voice: ${voicePreset || "Puck"}, text length: ${textToSpeak.length} characters. Reference audio: ${!!referenceAudio}`);
+    logToServer("info", "api", `Vocal Patch Generation Started. Voice preset: ${voicePreset || "Puck"}, text: "${textToSpeak.slice(0, 60)}${textToSpeak.length > 60 ? "..." : ""}" (${textToSpeak.length} chars). Has Style Guidelines: ${!!styleGuidelines}`);
 
-    // Note: Since 'gemini-3.1-flash-tts-preview' is a dedicated text-to-speech model, it accepts ONLY text input.
-    // Multimodal audio ingestion (reference audio) is not supported for TTS-specific models and causes an error.
-    const promptText = `You are a professional voice actor, speech synthesizer, and voice matching engine.
+    let promptText = "";
+    const parts: any[] = [];
+
+    if (referenceAudio && mimeType) {
+      parts.push({
+        inlineData: {
+          mimeType: mimeType,
+          data: referenceAudio
+        }
+      });
+      promptText = `You are a voice replication and speech cloning engine.
+Below is an audio recording of a target speaker's voice.
+Analyze the speaker's vocal characteristics (pitch, tone, accent, cadence, gender) in that audio recording.
+Your task is to speak the following text replicating that speaker's voice, pacing, timbre, and emotional delivery as closely as humanly possible:
+"${textToSpeak}"
+
+Guidelines:
+1. Speak the text in the EXACT same voice as the target speaker in the provided audio file.
+2. Maintain a completely natural, human cadence (avoid sounding robotic or monotonous).
+3. Do NOT add any introductory remarks, coughs, ambient sighs, or explanations. Output ONLY the clean spoken words.`;
+    } else {
+      promptText = `You are a professional voice actor, speech synthesizer, and voice matching engine.
 We are patching a podcast or spoken word recording.
 Your task is to speak the following text clearly, naturally, and with excellent vocal cadence:
 "${textToSpeak}"
@@ -221,26 +278,36 @@ Your task is to speak the following text clearly, naturally, and with excellent 
 Guidelines:
 1. Maintain a completely natural, human cadence (avoid sounding robotic or monotonous).
 2. Do NOT add any introductory remarks, coughs, ambient sighs, "here is your audio", or explanation. Output ONLY the clean spoken words.`;
+    }
 
-    const contents = [{ parts: [{ text: promptText }] }];
+    if (styleGuidelines && typeof styleGuidelines === "string" && styleGuidelines.trim()) {
+      promptText += `\n3. ADDITIONAL VOCAL STYLE TO EMULATE: ${styleGuidelines.trim()}`;
+    }
 
-    // Call Gemini with the AUDIO response modality config using the official TTS model
+    parts.push({ text: promptText });
+
+    const contents = [{ parts: parts }];
+
+    const config: any = {
+      responseModalities: ["AUDIO"]
+    };
+
+    if (voicePreset && voicePreset !== "cloned") {
+      config.speechConfig = {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: voicePreset
+          }
+        }
+      };
+    }
+
     const response = await callGeminiWithRetry(() => ai.models.generateContent({
       model: "gemini-3.1-flash-tts-preview",
       contents: contents,
-      config: {
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: voicePreset || "Puck" // Supported prebuilt voices: Puck, Charon, Fenrir, Kore, Zephyr
-            }
-          }
-        }
-      }
+      config: config
     }));
 
-    // Find the audio parts inside the candidates returned
     const candidates = response.candidates;
     const part = candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData?.mimeType?.startsWith("audio/"));
 
@@ -248,18 +315,101 @@ Guidelines:
       throw new Error("No audio bytes returned from Gemini API. Ensure the selected model and voice support speech generation.");
     }
 
-    console.log("Speech patch generation completed successfully.");
+    const sizeKb = Math.round(part.inlineData.data.length / 1024);
+    logToServer("success", "api", `Vocal Patch Generation Successful. Generated audio format: ${part.inlineData.mimeType}, size: ${sizeKb} KB.`);
     return res.json({
       audio: part.inlineData.data,
       mimeType: part.inlineData.mimeType
     });
 
   } catch (error: any) {
-    console.error("Error generating speech patch:", error);
+    logToServer("error", "api", `Vocal Patch Generation Failed: ${error.message}`, { stack: error.stack });
     return res.status(500).json({
       error: error.message || "An unexpected error occurred during speech patch generation."
     });
   }
+});
+
+// API endpoint to analyze vocal style from reference audio
+app.post("/api/analyze-voice", async (req, res) => {
+  try {
+    const { audio, mimeType } = req.body;
+    if (!audio) {
+      logToServer("warn", "api", "Voice analysis rejected: Missing 'audio' data.");
+      return res.status(400).json({ error: "Missing 'audio' data (base64 string required)." });
+    }
+    if (!mimeType) {
+      logToServer("warn", "api", "Voice analysis rejected: Missing 'mimeType'.");
+      return res.status(400).json({ error: "Missing 'mimeType'." });
+    }
+
+    const ai = getAI();
+    const sizeKb = Math.round(audio.length / 1024);
+    logToServer("info", "api", `Voice analysis requested. MimeType: ${mimeType}, Size: ${sizeKb} KB.`);
+
+    const userInstruction = "You are an expert voice scientist, speech dialect coach, and auditory phonetician.\n" +
+      "Analyze the vocal characteristics of the speaker in this audio recording.\n" +
+      "Extract details such as their perceived gender, pitch level, speaking rate, accent/dialect, and overall emotional tone or vibe.\n" +
+      "Based on these characteristics, select the best matching prebuilt voice preset from the following options:\n" +
+      "- 'Puck': Deep, warm, professional male narrator.\n" +
+      "- 'Charon': Mid-range, energetic, clear male voice.\n" +
+      "- 'Fenrir': Intense, slightly raspy, dramatic male voice.\n" +
+      "- 'Kore': Clear, high-pitched, crisp female voice.\n" +
+      "- 'Zephyr': Warm, smooth, airy female narrator.\n\n" +
+      "Return your analysis as a structured JSON object.";
+
+    const response = await generateContentWithFallback(ai, {
+      model: "gemini-3.5-flash",
+      contents: [
+        {
+          inlineData: {
+            mimeType: mimeType,
+            data: audio,
+          },
+        },
+        userInstruction
+      ],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: "OBJECT",
+          properties: {
+            gender: { type: "STRING", description: "Perceived gender or voice type (e.g. Female, Male, Non-binary, Warm Neutral)" },
+            pitch: { type: "STRING", description: "Vocal pitch classification (e.g. Low, Medium-Low, Medium, Medium-High, High)" },
+            speed: { type: "STRING", description: "Speaking speed and pacing (e.g. Slow, Normal, Fast, Measured)" },
+            accent: { type: "STRING", description: "Detected accent or regional dialect (e.g. General American, Southern British, French accented, Neutral English)" },
+            vibe: { type: "STRING", description: "Overall vocal tone, mood, and delivery style (e.g. Professional and Warm, Crisp and Energetic, Gentle, Raspy and Dramatic)" },
+            suggestedPreset: { 
+              type: "STRING", 
+              description: "The closest prebuilt voice name of the five available: Puck, Charon, Fenrir, Kore, or Zephyr" 
+            },
+            explanation: { type: "STRING", description: "A detailed 2-3 sentence analysis of the speaker's vocal profile and why the prebuilt preset was chosen as the closest match." }
+          },
+          required: ["gender", "pitch", "speed", "accent", "vibe", "suggestedPreset", "explanation"]
+        }
+      }
+    });
+
+    const text = response.text;
+    if (!text) {
+      throw new Error("No output text received from Gemini voice analyzer.");
+    }
+
+    const parsed = JSON.parse(text);
+    logToServer("success", "api", `Voice analysis successful. Recommended preset: ${parsed.suggestedPreset}.`);
+    return res.json(parsed);
+
+  } catch (error: any) {
+    logToServer("error", "api", `Voice analysis failed: ${error.message}`, { stack: error.stack });
+    return res.status(500).json({
+      error: error.message || "An unexpected error occurred during vocal profile analysis."
+    });
+  }
+});
+
+// API endpoint to fetch server level logs for Diagnostics panel
+app.get("/api/logs", (req, res) => {
+  return res.json(serverLogsList);
 });
 
 async function startServer() {

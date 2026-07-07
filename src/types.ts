@@ -15,3 +15,12 @@ export interface AnalysisResult {
     transcript: string;
   }[];
 }
+
+export interface AppLog {
+  id: string;
+  timestamp: string;
+  level: "info" | "warn" | "error" | "success";
+  category: "click" | "action" | "api" | "browser" | "server";
+  message: string;
+  details?: string;
+}

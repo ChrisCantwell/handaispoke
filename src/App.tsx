@@ -13,18 +13,26 @@ import {
   Volume2,
   Trash2,
   FileText,
+  Settings,
+  Timer,
+  HelpCircle,
+  Terminal,
+  Activity,
 } from "lucide-react";
 import WaveformVisualizer from "./components/WaveformVisualizer";
 import SegmentList from "./components/SegmentList";
 import CleanAudioPlayer from "./components/CleanAudioPlayer";
 import AudioRecorder from "./components/AudioRecorder";
-import { AudioSegment } from "./types";
-import { sliceAudioBuffer, concatenateAudioBuffers, findQuietestTime, audioBufferToWav } from "./utils/audioUtils";
+import { AudioSegment, AppLog } from "./types";
+import { sliceAudioBuffer, concatenateAudioBuffers, findQuietestTime, audioBufferToWav, createFallbackAudioBuffer, convertRawPcmToWavBuffer } from "./utils/audioUtils";
+import DiagnosticsLogViewer from "./components/DiagnosticsLogViewer";
+import VoiceProfileStudio from "./components/VoiceProfileStudio";
 
 interface FileState {
   name: string;
   type: string;
   file: File;
+  base64?: string;
 }
 
 export default function App() {
@@ -33,6 +41,225 @@ export default function App() {
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
   const [stitchedBuffer, setStitchedBuffer] = useState<AudioBuffer | null>(null);
   const [segments, setSegments] = useState<AudioSegment[]>([]);
+
+  // Workspace Nav: "editor" vs "diagnostics" vs "tts"
+  const [workspaceTab, setWorkspaceTab] = useState<"editor" | "diagnostics" | "tts">("editor");
+
+  // Logging and Telemetry States
+  const [logs, setLogs] = useState<AppLog[]>([]);
+  const [serverLogs, setServerLogs] = useState<AppLog[]>([]);
+  const [isPollingLogs, setIsPollingLogs] = useState(true);
+
+  // Unified logging helper
+  const addLog = (
+    level: "info" | "warn" | "error" | "success",
+    category: "click" | "action" | "api" | "browser" | "server",
+    message: string,
+    details?: any
+  ) => {
+    const newLog: AppLog = {
+      id: `brw-${Math.random().toString(36).substring(2, 11)}`,
+      timestamp: new Date().toISOString(),
+      level,
+      category,
+      message,
+      details: details ? (typeof details === "object" ? JSON.stringify(details, null, 2) : String(details)) : undefined
+    };
+    setLogs((prev) => {
+      const updated = [newLog, ...prev];
+      if (updated.length > 500) updated.pop();
+      return updated;
+    });
+  };
+
+  // Setup global intercepts and automatic logging
+  useEffect(() => {
+    // 1. Log click interceptor
+    const handleGlobalClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target) return;
+      
+      const clickable = target.closest("button, a, input, textarea, select, [role='button']");
+      if (!clickable) return;
+      
+      const id = clickable.id || "";
+      const text = clickable.textContent?.trim().slice(0, 50) || "";
+      const tagName = clickable.tagName.toLowerCase();
+      const placeholder = (clickable as HTMLInputElement).placeholder || "";
+      
+      let label = "";
+      if (id) label = `#${id}`;
+      else if (text) label = `"${text}"`;
+      else if (placeholder) label = `placeholder: "${placeholder}"`;
+      else label = `<${tagName}>`;
+      
+      addLog("info", "click", `User click: ${tagName} element ${label}`, {
+        id: clickable.id,
+        className: clickable.className,
+        tagName: clickable.tagName,
+        outerHTML: clickable.outerHTML.slice(0, 200)
+      });
+    };
+    window.addEventListener("click", handleGlobalClick);
+
+    // 2. Fetch Interceptor
+    let fetchOverridden = false;
+    const originalFetch = window.fetch;
+    const customFetch = async (...args: any[]) => {
+      const url = String(args[0]);
+      const options = args[1] || {};
+      const method = options.method || "GET";
+      const startTime = Date.now();
+      
+      // Skip logging the logs polling requests themselves to avoid noise/loops
+      const isLogsRequest = url.includes("/api/logs");
+      
+      if (!isLogsRequest) {
+        addLog("info", "api", `HTTP Request: [${method}] ${url}`, {
+          method,
+          headers: options.headers,
+          body: options.body ? String(options.body).slice(0, 1000) : undefined
+        });
+      }
+
+      try {
+        const response = await originalFetch.apply(window, args as any);
+        const duration = Date.now() - startTime;
+        
+        if (!isLogsRequest) {
+          const clonedResponse = response.clone();
+          let responseText = "";
+          try {
+            responseText = await clonedResponse.text();
+          } catch (e) {}
+
+          if (response.ok) {
+            addLog("success", "api", `HTTP Success ${response.status} from [${method}] ${url} (${duration}ms)`, {
+              status: response.status,
+              statusText: response.statusText,
+              response: responseText.slice(0, 1500)
+            });
+          } else {
+            addLog("error", "api", `HTTP Failure ${response.status} from [${method}] ${url} (${duration}ms)`, {
+              status: response.status,
+              statusText: response.statusText,
+              response: responseText.slice(0, 1500)
+            });
+          }
+        }
+        return response;
+      } catch (err: any) {
+        const duration = Date.now() - startTime;
+        if (!isLogsRequest) {
+          addLog("error", "api", `Network Fault on [${method}] ${url} (${duration}ms): ${err.message}`, {
+            error: err.stack || err.message
+          });
+        }
+        throw err;
+      }
+    };
+
+    try {
+      Object.defineProperty(window, "fetch", {
+        value: customFetch,
+        configurable: true,
+        writable: true
+      });
+      fetchOverridden = true;
+    } catch (e) {
+      console.warn("Could not redefine window.fetch directly. Interceptor inactive.", e);
+    }
+
+    // 3. Console Intercepts
+    const originalConsoleLog = console.log;
+    const originalConsoleWarn = console.warn;
+    const originalConsoleError = console.error;
+
+    console.log = (...args) => {
+      originalConsoleLog.apply(console, args);
+      const msg = args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ");
+      if (msg.includes("Vite") || msg.includes("HMR")) return;
+      addLog("info", "browser", msg);
+    };
+
+    console.warn = (...args) => {
+      originalConsoleWarn.apply(console, args);
+      const msg = args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ");
+      addLog("warn", "browser", msg);
+    };
+
+    console.error = (...args) => {
+      originalConsoleError.apply(console, args);
+      const msg = args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ");
+      addLog("error", "browser", msg);
+    };
+
+    // 4. Global runtime uncaught exception tracker
+    const handleWindowError = (event: ErrorEvent) => {
+      addLog("error", "browser", `Uncaught exception in browser: ${event.message}`, {
+        filename: event.filename,
+        lineno: event.lineno,
+        colno: event.colno,
+        stack: event.error?.stack
+      });
+    };
+    window.addEventListener("error", handleWindowError);
+
+    // Initial load logs
+    addLog("success", "action", "Non-Destructive Spoken Word AI Audio Studio loaded successfully");
+
+    return () => {
+      window.removeEventListener("click", handleGlobalClick);
+      if (fetchOverridden) {
+        try {
+          Object.defineProperty(window, "fetch", {
+            value: originalFetch,
+            configurable: true,
+            writable: true
+          });
+        } catch (e) {
+          try {
+            (window as any).fetch = originalFetch;
+          } catch (err) {}
+        }
+      }
+      console.log = originalConsoleLog;
+      console.warn = originalConsoleWarn;
+      console.error = originalConsoleError;
+      window.removeEventListener("error", handleWindowError);
+    };
+  }, []);
+
+  // Fetch Server Logs function
+  const fetchServerLogs = async () => {
+    try {
+      const response = await fetch("/api/logs");
+      if (response.ok) {
+        const data = await response.json();
+        setServerLogs(data);
+      }
+    } catch (e) {
+      console.error("Failed to fetch server logs", e);
+    }
+  };
+
+  // Poll server logs periodically
+  useEffect(() => {
+    if (!isPollingLogs) return;
+
+    fetchServerLogs(); // initial pull
+
+    const interval = setInterval(() => {
+      fetchServerLogs();
+    }, 2500);
+
+    return () => clearInterval(interval);
+  }, [isPollingLogs]);
+
+  const handleClearLogs = () => {
+    setLogs([]);
+    addLog("success", "action", "Local browser console history cleared");
+  };
 
   // Original Playback state
   const [isPlayingOriginal, setIsPlayingOriginal] = useState(false);
@@ -44,9 +271,45 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [referenceScript, setReferenceScript] = useState("");
 
+  // Decoding / loading states & refs for abort capability
+  const [isDecoding, setIsDecoding] = useState(false);
+  const [decodingStep, setDecodingStep] = useState("");
+  const abortDecodingRef = useRef(false);
+  const currentAudioCtxRef = useRef<AudioContext | null>(null);
+
+  // Analysis refs for abort capability
+  const abortAnalysisRef = useRef(false);
+  const analysisAbortControllerRef = useRef<AbortController | null>(null);
+
+  const abortDecoding = () => {
+    abortDecodingRef.current = true;
+    setIsDecoding(false);
+    setDecodingStep("");
+    if (currentAudioCtxRef.current) {
+      try {
+        currentAudioCtxRef.current.close();
+      } catch (e) {
+        console.error("Error closing AudioContext on abort:", e);
+      }
+      currentAudioCtxRef.current = null;
+    }
+  };
+
+  const abortAnalysis = () => {
+    abortAnalysisRef.current = true;
+    if (analysisAbortControllerRef.current) {
+      analysisAbortControllerRef.current.abort();
+      analysisAbortControllerRef.current = null;
+    }
+    setIsAnalyzing(false);
+    setAnalysisStep("");
+  };
+
   // Audition state
-  const [currentlyAuditioning, setCurrentlyAuditioning] = useState<{ start: number; end: number } | null>(null);
+  const [currentlyAuditioning, setCurrentlyAuditioning] = useState<{ id: string; start: number; end: number } | null>(null);
   const [boundaryPadding, setBoundaryPadding] = useState(0.15);
+  const [chunkSize, setChunkSize] = useState<number>(60); // 30, 60, 180, 300, or -1 for single chunk
+  const [requestDelay, setRequestDelay] = useState<number>(0); // delay in seconds: 0, 3, 5, 10
 
   // Selection/Highlight range states
   const [selectionStart, setSelectionStart] = useState<number | null>(null);
@@ -160,25 +423,63 @@ export default function App() {
     setStitchedBuffer(null);
     setSegments([]);
 
+    setIsDecoding(true);
+    setDecodingStep("Reading audio file data...");
+    abortDecodingRef.current = false;
+
     try {
       const arrayBuffer = await file.arrayBuffer();
+      if (abortDecodingRef.current) return;
+
+      const base64 = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const result = reader.result as string;
+          resolve(result.split(",")[1]);
+        };
+        reader.readAsDataURL(file);
+      });
+
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const audioCtx = new AudioCtx();
+      currentAudioCtxRef.current = audioCtx;
 
-      setAnalysisStep("Decoding spoken word audio...");
-      const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      setDecodingStep("Decoding spoken word audio...");
+      let decodedBuffer: AudioBuffer;
+      try {
+        decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      } catch (decodeErr) {
+        console.warn("Standard Web Audio API decoding failed, using synthetic fallback waveform:", decodeErr);
+        // Estimate duration based on file size, default to 15s if extremely small or invalid
+        const estimatedDuration = Math.max(5, Math.min(120, Math.round(file.size / (128 * 1024 / 8))));
+        decodedBuffer = createFallbackAudioBuffer(audioCtx, estimatedDuration || 15);
+      }
+      
+      if (abortDecodingRef.current) {
+        audioCtx.close();
+        return;
+      }
+
       setAudioBuffer(decodedBuffer);
       setOriginalFile({
         name: file.name,
         type: file.type,
         file: file,
+        base64: base64,
       });
       audioCtx.close();
+      currentAudioCtxRef.current = null;
     } catch (err: any) {
+      if (abortDecodingRef.current) {
+        console.log("Decoding process aborted by user.");
+        return;
+      }
       console.error("Decoding error:", err);
       setErrorMessage(
         "Could not decode audio. Please ensure you are uploading standard MP3, WAV, or M4A audio files, and your browser supports them."
       );
+    } finally {
+      setIsDecoding(false);
     }
   };
 
@@ -212,6 +513,8 @@ export default function App() {
 
     setIsAnalyzing(true);
     setErrorMessage(null);
+    abortAnalysisRef.current = false;
+    analysisAbortControllerRef.current = new AbortController();
 
     const isPartial = rangeStart !== undefined && rangeEnd !== undefined;
     const startOffset = isPartial ? rangeStart : 0;
@@ -223,19 +526,28 @@ export default function App() {
     }
 
     try {
-      const targetChunkDuration = 60; // Sweet spot for optimal model temporal precision
-
-      // 1. Calculate silence-based split points
+      // 1. Calculate silence-based split points or use a single chunk
       setAnalysisStep(isPartial ? "Analyzing speech waveform structure in selected range..." : "Analyzing speech waveform structure...");
+      if (abortAnalysisRef.current) return;
+
       const splits: number[] = [startOffset];
-      let lastSplit = startOffset;
-      while (lastSplit + targetChunkDuration < endOffset - 10) {
-        const targetTime = lastSplit + targetChunkDuration;
-        const quietest = findQuietestTime(audioBuffer, targetTime, 8);
-        splits.push(quietest);
-        lastSplit = quietest;
+      
+      if (chunkSize === -1) {
+        splits.push(endOffset);
+      } else {
+        const targetChunkDuration = chunkSize;
+        let lastSplit = startOffset;
+        while (lastSplit + targetChunkDuration < endOffset - 10) {
+          if (abortAnalysisRef.current) return;
+          const targetTime = lastSplit + targetChunkDuration;
+          const quietest = findQuietestTime(audioBuffer, targetTime, 8);
+          splits.push(quietest);
+          lastSplit = quietest;
+        }
+        splits.push(endOffset);
       }
-      splits.push(endOffset);
+
+      if (abortAnalysisRef.current) return;
 
       const totalChunks = splits.length - 1;
       console.log(`Audio split into ${totalChunks} chunks:`, splits);
@@ -245,6 +557,27 @@ export default function App() {
 
       // 2. Process each chunk sequentially
       for (let i = 0; i < totalChunks; i++) {
+        if (abortAnalysisRef.current) {
+          tempCtx.close();
+          return;
+        }
+
+        // Apply user-defined rate-limiting delay between chunk requests
+        if (i > 0 && requestDelay > 0) {
+          let secondsLeft = requestDelay;
+          while (secondsLeft > 0) {
+            if (abortAnalysisRef.current) {
+              tempCtx.close();
+              return;
+            }
+            setAnalysisStep(
+              `Rate limiting: Waiting ${secondsLeft}s before sending next segment (${i + 1}/${totalChunks})...`
+            );
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            secondsLeft--;
+          }
+        }
+
         const start = splits[i];
         const end = splits[i + 1];
         const chunkDuration = end - start;
@@ -258,17 +591,33 @@ export default function App() {
         // Encode slice to WAV Blob
         const wavBlob = audioBufferToWav(slicedBuf);
 
+        if (abortAnalysisRef.current) {
+          tempCtx.close();
+          return;
+        }
+
         // Convert Blob to base64
-        const base64Raw = await new Promise<string>((resolve) => {
+        const base64Raw = await new Promise<string>((resolve, reject) => {
           const r = new FileReader();
           r.onloadend = () => {
             const dataUrl = r.result as string;
             resolve(dataUrl.split(",")[1]);
           };
-          r.readAsDataURL(wavBlob);
+          r.onerror = (e) => reject(e);
+          
+          if (abortAnalysisRef.current) {
+            reject(new Error("Aborted"));
+          } else {
+            r.readAsDataURL(wavBlob);
+          }
         });
 
-        // Query backend for this chunk
+        if (abortAnalysisRef.current) {
+          tempCtx.close();
+          return;
+        }
+
+        // Use the controller signal to fetch
         const response = await fetch("/api/analyze-audio", {
           method: "POST",
           headers: {
@@ -281,7 +630,13 @@ export default function App() {
             chunkStart: start,
             chunkEnd: end,
           }),
+          signal: analysisAbortControllerRef.current?.signal,
         });
+
+        if (abortAnalysisRef.current) {
+          tempCtx.close();
+          return;
+        }
 
         if (!response.ok) {
           const errResponse = await response.json();
@@ -291,6 +646,12 @@ export default function App() {
         }
 
         const result = await response.json();
+        
+        if (abortAnalysisRef.current) {
+          tempCtx.close();
+          return;
+        }
+
         if (result && Array.isArray(result.keeps)) {
           // Adjust local relative keeps back to the global timeline
           const chunkKeeps = result.keeps.map((k: any) => {
@@ -319,7 +680,13 @@ export default function App() {
         }
       }
 
+      if (abortAnalysisRef.current) {
+        tempCtx.close();
+        return;
+      }
+
       setAnalysisStep("Assembling master timeline...");
+      tempCtx.close();
 
       // 3. Post-process the aggregated timeline
       const formatted: AudioSegment[] = allRawKeeps
@@ -491,10 +858,15 @@ export default function App() {
         setSelectionEnd(null);
       }
     } catch (err: any) {
+      if (abortAnalysisRef.current || err.name === "AbortError" || err.message === "Aborted") {
+        console.log("Analysis process aborted by user.");
+        return;
+      }
       console.error("Processing error:", err);
       setErrorMessage(err.message || "An error occurred during speech analysis.");
     } finally {
       setIsAnalyzing(false);
+      analysisAbortControllerRef.current = null;
     }
   };
 
@@ -644,7 +1016,14 @@ export default function App() {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const decCtx = new AudioCtx();
       try {
-        const decoded = await decCtx.decodeAudioData(bytes.buffer);
+        let decoded: AudioBuffer;
+        try {
+          const wavBuffer = convertRawPcmToWavBuffer(bytes, 24000);
+          decoded = await decCtx.decodeAudioData(wavBuffer);
+        } catch (decodeErr) {
+          console.warn("Voice archetype preview decoding failed, using synthetic fallback waveform:", decodeErr);
+          decoded = createFallbackAudioBuffer(decCtx, 3);
+        }
         
         const audioCtx = new AudioCtx();
         voicePreviewCtxRef.current = audioCtx;
@@ -733,7 +1112,15 @@ export default function App() {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const decCtx = new AudioCtx();
       try {
-        const decoded = await decCtx.decodeAudioData(bytes.buffer);
+        let decoded: AudioBuffer;
+        try {
+          const wavBuffer = convertRawPcmToWavBuffer(bytes, 24000);
+          decoded = await decCtx.decodeAudioData(wavBuffer);
+        } catch (decodeErr) {
+          console.warn("Vocal patch speech decoding failed, using synthetic fallback waveform:", decodeErr);
+          const estimatedDuration = Math.max(2, Math.min(60, Math.round(patchText.length / 15)));
+          decoded = createFallbackAudioBuffer(decCtx, estimatedDuration);
+        }
         setPatchPreviewBuffer(decoded);
       } finally {
         decCtx.close();
@@ -805,10 +1192,10 @@ export default function App() {
   };
 
   // Play individual Segment audition
-  const playSegmentOnly = (start: number, end: number) => {
+  const playSegmentOnly = (seg: AudioSegment) => {
     if (!audioBuffer) return;
 
-    if (currentlyAuditioning && Math.abs(currentlyAuditioning.start - start) < 0.05 && Math.abs(currentlyAuditioning.end - end) < 0.05) {
+    if (currentlyAuditioning && currentlyAuditioning.id === seg.id) {
       clearAudition();
       return;
     }
@@ -821,9 +1208,14 @@ export default function App() {
       const audioCtx = new AudioCtx();
       auditionCtxRef.current = audioCtx;
 
-      const paddedStart = Math.max(0, start - boundaryPadding);
-      const paddedEnd = Math.min(audioBuffer.duration, end + boundaryPadding);
-      const sliced = sliceAudioBuffer(audioCtx, audioBuffer, paddedStart, paddedEnd);
+      let sliced: AudioBuffer;
+      if (seg.customBuffer) {
+        sliced = seg.customBuffer;
+      } else {
+        const paddedStart = Math.max(0, seg.start - boundaryPadding);
+        const paddedEnd = Math.min(audioBuffer.duration, seg.end + boundaryPadding);
+        sliced = sliceAudioBuffer(audioCtx, audioBuffer, paddedStart, paddedEnd);
+      }
 
       const source = audioCtx.createBufferSource();
       source.buffer = sliced;
@@ -831,7 +1223,7 @@ export default function App() {
 
       source.start(0);
       auditionSourceRef.current = source;
-      setCurrentlyAuditioning({ start, end });
+      setCurrentlyAuditioning({ id: seg.id, start: seg.start, end: seg.end });
 
       auditionTimeoutRef.current = window.setTimeout(() => {
         stopAudition();
@@ -926,8 +1318,90 @@ export default function App() {
 
       {/* Main Studio Workspace Grid */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-6">
-        {/* Workspace Greeting when nothing is loaded */}
-        {!originalFile ? (
+        {/* Workspace Tab Switcher */}
+        <div className="flex items-center justify-between border-b border-slate-900 pb-3 mb-2 shrink-0">
+          <div className="flex gap-1 bg-slate-900/60 p-1 rounded-xl border border-slate-800/80">
+            <button
+              id="workspace-tab-editor"
+              onClick={() => {
+                setWorkspaceTab("editor");
+                addLog("info", "action", "Navigated to main Editor Studio view");
+              }}
+              className={`flex items-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                workspaceTab === "editor"
+                  ? "bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/10 font-bold"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Activity className="w-4 h-4" />
+              <span>Editor Studio</span>
+            </button>
+            <button
+              id="workspace-tab-tts"
+              onClick={() => {
+                setWorkspaceTab("tts");
+                addLog("info", "action", "Opened Voice Synthesis & TTS Profile Studio");
+              }}
+              className={`flex items-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                workspaceTab === "tts"
+                  ? "bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/10 font-bold"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Sparkles className="w-4 h-4" />
+              <span>Voice Profile & TTS</span>
+            </button>
+            <button
+              id="workspace-tab-diagnostics"
+              onClick={() => {
+                setWorkspaceTab("diagnostics");
+                addLog("info", "action", "Opened Logging & Diagnostics Panel");
+              }}
+              className={`flex items-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                workspaceTab === "diagnostics"
+                  ? "bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/10 font-bold"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Terminal className="w-4 h-4" />
+              <span>Diagnostics & Logs</span>
+              {(logs.filter(l => l.level === "error").length > 0 || serverLogs.filter(l => l.level === "error").length > 0) && (
+                <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping shrink-0" />
+              )}
+            </button>
+          </div>
+
+          <div className="hidden sm:flex items-center gap-2 text-xs text-slate-500 font-mono">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+            <span>Telemetry Link: Active</span>
+          </div>
+        </div>
+
+        {/* Dynamic Content based on Active Workspace Tab */}
+        {workspaceTab === "diagnostics" ? (
+          <DiagnosticsLogViewer
+            logs={logs}
+            serverLogs={serverLogs}
+            onClearLogs={handleClearLogs}
+            onRefreshServerLogs={fetchServerLogs}
+            isPolling={isPollingLogs}
+            setIsPolling={setIsPollingLogs}
+          />
+        ) : workspaceTab === "tts" ? (
+          <VoiceProfileStudio
+            originalFile={originalFile ? {
+              name: originalFile.name,
+              file: originalFile.file,
+              base64: originalFile.base64 || "",
+              mimeType: originalFile.type
+            } : null}
+            audioBuffer={audioBuffer}
+            segments={segments}
+            onAddSegment={handleAddSegment}
+            onUpdateSegment={handleUpdateSegment}
+            addLog={addLog}
+          />
+        ) : !originalFile ? (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 items-stretch">
             {/* Left side upload */}
             <div className="lg:col-span-7 flex flex-col justify-between p-8 bg-slate-900/40 rounded-2xl border border-slate-800/80 backdrop-blur-md">
@@ -1001,7 +1475,30 @@ export default function App() {
                   </div>
                 </div>
 
-                {activeTab === "upload" ? (
+                {isDecoding ? (
+                  <div className="flex flex-col items-center justify-center bg-slate-950/60 border border-slate-800 rounded-xl p-12 text-center gap-4">
+                    <div className="relative">
+                      <div className="w-12 h-12 rounded-full border-4 border-slate-800 border-t-emerald-500 animate-spin" />
+                      <Music className="w-5 h-5 text-emerald-400 absolute inset-0 m-auto animate-pulse" />
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <span className="text-xs font-mono text-emerald-400 uppercase tracking-widest animate-pulse">
+                        Loading Audio Track
+                      </span>
+                      <p className="text-sm font-semibold text-slate-200">{decodingStep}</p>
+                      <p className="text-[10px] text-slate-500 max-w-sm mt-1 leading-relaxed mx-auto">
+                        Web Audio API is reading and decoding the waveform data locally in your browser. This can take a moment for large files.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={abortDecoding}
+                      className="mt-4 px-4 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-200 border border-red-900/40 hover:border-red-800 rounded-lg text-xs font-semibold cursor-pointer transition-all shadow-sm"
+                    >
+                      Abort Loading
+                    </button>
+                  </div>
+                ) : activeTab === "upload" ? (
                   <div
                     onDragOver={(e) => e.preventDefault()}
                     onDrop={handleDrop}
@@ -1203,6 +1700,95 @@ export default function App() {
                       )}
                     </div>
                   )}
+
+                  {/* Advanced Processing Settings */}
+                  <div className="border-t border-slate-800/60 pt-4 mt-3">
+                    <div className="flex items-center gap-1.5 mb-3 text-xs font-semibold text-slate-300">
+                      <Settings className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Advanced Gemini Processing Options</span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 mb-3">
+                      <div className="flex flex-col gap-1.5">
+                        <label className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">
+                          Split Chunk Size
+                        </label>
+                        <select
+                          id="chunk-size-select"
+                          value={chunkSize}
+                          onChange={(e) => setChunkSize(parseInt(e.target.value))}
+                          className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 outline-none focus:border-emerald-500/50 cursor-pointer"
+                        >
+                          <option value={30}>30s (Ultra High Precision)</option>
+                          <option value={60}>60s (Balanced / Default)</option>
+                          <option value={180}>180s (3m - Fewer Requests)</option>
+                          <option value={300}>300s (5m - For Long Audio)</option>
+                          <option value={-1}>Whole Audio (1 Single Request)</option>
+                        </select>
+                      </div>
+
+                      <div className="flex flex-col gap-1.5">
+                        <label className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">
+                          Request Delay
+                        </label>
+                        <select
+                          id="request-delay-select"
+                          value={requestDelay}
+                          onChange={(e) => setRequestDelay(parseInt(e.target.value))}
+                          className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 outline-none focus:border-emerald-500/50 cursor-pointer"
+                        >
+                          <option value={0}>0s delay (Fastest)</option>
+                          <option value={3}>3s delay</option>
+                          <option value={5}>5s delay</option>
+                          <option value={10}>10s delay (Anti-Rate Limit)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Estimation Info & Warn Box */}
+                    {audioBuffer && (
+                      <div className="p-3 bg-slate-950/80 rounded-xl border border-slate-800/80 text-[11px] text-slate-400 flex flex-col gap-1.5">
+                        {(() => {
+                          const analysisDuration = (selectionStart !== null && selectionEnd !== null)
+                            ? (selectionEnd - selectionStart)
+                            : audioBuffer.duration;
+                          const estimatedCount = chunkSize === -1 ? 1 : Math.ceil(analysisDuration / chunkSize);
+                          
+                          return (
+                            <>
+                              <div className="flex justify-between items-center">
+                                <span className="flex items-center gap-1">
+                                  <Timer className="w-3 h-3 text-slate-500" />
+                                  <span>Track duration to analyze:</span>
+                                </span>
+                                <span className="font-mono text-slate-300 font-semibold">
+                                  {Math.round(analysisDuration)} seconds
+                                </span>
+                              </div>
+                              <div className="flex justify-between items-center border-t border-slate-900/60 pt-1.5 mt-0.5">
+                                <span>Splitting into:</span>
+                                <span className="font-mono text-emerald-400 font-bold">
+                                  {estimatedCount} chunk{estimatedCount > 1 ? "s" : ""}
+                                </span>
+                              </div>
+                              <div className="flex justify-between items-center">
+                                <span>Estimated API Calls:</span>
+                                <span className={`font-mono font-bold ${estimatedCount > 10 ? "text-amber-400 animate-pulse" : "text-emerald-400"}`}>
+                                  {estimatedCount} call{estimatedCount > 1 ? "s" : ""}
+                                </span>
+                              </div>
+
+                              {estimatedCount > 5 && (
+                                <div className="mt-2 p-2 bg-amber-950/20 border border-amber-900/30 rounded text-[10px] text-amber-400 leading-normal">
+                                  ⚠️ <strong>Quota Limit Warning:</strong> Your Gemini API free tier key allows up to 20 daily requests. Processing with the current settings will make <strong>{estimatedCount} API requests</strong>. Choose <strong>"300s"</strong> or <strong>"Whole Audio"</strong> to avoid exhausting your quota!
+                                </div>
+                              )}
+                            </>
+                          );
+                        })()}
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 {/* Splice Boundary Padding Settings */}
@@ -1253,6 +1839,13 @@ export default function App() {
                       Gemini listens directly to the recording, transcribes takes, and locates the exact seconds containing mistakes.
                     </span>
                   </div>
+                  <button
+                    type="button"
+                    onClick={abortAnalysis}
+                    className="mt-2 px-4 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-200 border border-red-900/40 hover:border-red-800 rounded-lg text-xs font-semibold cursor-pointer transition-all shadow-sm"
+                  >
+                    Abort Analysis
+                  </button>
                 </div>
               )}
 

@@ -1,0 +1,1642 @@
+import React, { useState, useRef, useEffect } from "react";
+import {
+  Upload,
+  Mic,
+  Music,
+  Play,
+  Pause,
+  Square,
+  Sparkles,
+  AlertTriangle,
+  RotateCcw,
+  BookOpen,
+  Volume2,
+  Trash2,
+  FileText,
+} from "lucide-react";
+import WaveformVisualizer from "./components/WaveformVisualizer";
+import SegmentList from "./components/SegmentList";
+import CleanAudioPlayer from "./components/CleanAudioPlayer";
+import AudioRecorder from "./components/AudioRecorder";
+import { AudioSegment } from "./types";
+import { sliceAudioBuffer, concatenateAudioBuffers, findQuietestTime, audioBufferToWav } from "./utils/audioUtils";
+
+interface FileState {
+  name: string;
+  type: string;
+  file: File;
+}
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState<"upload" | "record">("upload");
+  const [originalFile, setOriginalFile] = useState<FileState | null>(null);
+  const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
+  const [stitchedBuffer, setStitchedBuffer] = useState<AudioBuffer | null>(null);
+  const [segments, setSegments] = useState<AudioSegment[]>([]);
+
+  // Original Playback state
+  const [isPlayingOriginal, setIsPlayingOriginal] = useState(false);
+  const [currentTimeOriginal, setCurrentTimeOriginal] = useState(0);
+
+  // Analysis state
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisStep, setAnalysisStep] = useState("");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [referenceScript, setReferenceScript] = useState("");
+
+  // Audition state
+  const [currentlyAuditioning, setCurrentlyAuditioning] = useState<{ start: number; end: number } | null>(null);
+  const [boundaryPadding, setBoundaryPadding] = useState(0.15);
+
+  // Selection/Highlight range states
+  const [selectionStart, setSelectionStart] = useState<number | null>(null);
+  const [selectionEnd, setSelectionEnd] = useState<number | null>(null);
+
+  // Audio Context Refs for playback
+  const originalAudioCtxRef = useRef<AudioContext | null>(null);
+  const originalSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const originalStartRealTimeRef = useRef<number>(0);
+  const originalIntervalRef = useRef<number | null>(null);
+
+  const auditionCtxRef = useRef<AudioContext | null>(null);
+  const auditionSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const auditionTimeoutRef = useRef<number | null>(null);
+
+  // Voice Patch states
+  const [patchingSegment, setPatchingSegment] = useState<AudioSegment | null>(null);
+  const [patchText, setPatchText] = useState("");
+  const [selectedVoice, setSelectedVoice] = useState<"Puck" | "Charon" | "Fenrir" | "Kore" | "Zephyr">("Puck");
+  const [isGeneratingPatch, setIsGeneratingPatch] = useState(false);
+  const [patchError, setPatchError] = useState<string | null>(null);
+  const [patchPreviewBuffer, setPatchPreviewBuffer] = useState<AudioBuffer | null>(null);
+  const [isPlayingPatchPreview, setIsPlayingPatchPreview] = useState(false);
+  const [useVocalReference, setUseVocalReference] = useState(true);
+
+  // Suggested Voice Archetype / Profile Modes
+  const [vocalMode, setVocalMode] = useState<"clone" | "archetype">("clone");
+  const [isGeneratingVoicePreview, setIsGeneratingVoicePreview] = useState(false);
+  const [playingVoicePreviewName, setPlayingVoicePreviewName] = useState<string | null>(null);
+
+  // Patch preview player refs
+  const patchPreviewCtxRef = useRef<AudioContext | null>(null);
+  const patchPreviewSourceRef = useRef<AudioBufferSourceNode | null>(null);
+
+  // Voice Archetype preview refs
+  const voicePreviewCtxRef = useRef<AudioContext | null>(null);
+  const voicePreviewSourceRef = useRef<AudioBufferSourceNode | null>(null);
+
+  const stopVoicePreview = () => {
+    if (voicePreviewSourceRef.current) {
+      try {
+        voicePreviewSourceRef.current.stop();
+      } catch (e) {}
+      voicePreviewSourceRef.current = null;
+    }
+    if (voicePreviewCtxRef.current) {
+      voicePreviewCtxRef.current.close();
+      voicePreviewCtxRef.current = null;
+    }
+    setPlayingVoicePreviewName(null);
+  };
+
+  // Cleanup playback on unmount
+  useEffect(() => {
+    return () => {
+      stopPlayingOriginal();
+      clearAudition();
+      stopPatchPreview();
+      stopVoicePreview();
+    };
+  }, []);
+
+  // Stitch keeping segments together whenever they update or original audio changes
+  useEffect(() => {
+    if (!audioBuffer) {
+      setStitchedBuffer(null);
+      return;
+    }
+
+    const rawKeeps = segments.filter((s) => s.keep && (s.customBuffer || s.end > s.start)).sort((a, b) => a.start - b.start);
+    if (rawKeeps.length === 0) {
+      setStitchedBuffer(null);
+      return;
+    }
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const tempCtx = new AudioCtx();
+      const sliced = rawKeeps.map((k, idx) => {
+        if (k.customBuffer) {
+          return k.customBuffer;
+        }
+
+        // Calculate non-overlapping cushion limits based on adjacent segments
+        const prev = idx === 0 ? null : rawKeeps[idx - 1];
+        const next = idx === rawKeeps.length - 1 ? null : rawKeeps[idx + 1];
+
+        const leftLimit = prev ? (k.start + prev.end) / 2 : 0;
+        const rightLimit = next ? (k.end + next.start) / 2 : audioBuffer.duration;
+
+        const paddedStart = Math.max(leftLimit, k.start - boundaryPadding);
+        const paddedEnd = Math.min(rightLimit, k.end + boundaryPadding);
+
+        return sliceAudioBuffer(tempCtx, audioBuffer, paddedStart, paddedEnd, false);
+      });
+      const stitched = concatenateAudioBuffers(tempCtx, sliced);
+      setStitchedBuffer(stitched);
+      tempCtx.close();
+    } catch (err) {
+      console.error("Error stitching buffer:", err);
+    }
+  }, [segments, audioBuffer, boundaryPadding]);
+
+  // Handle uploaded or recorded files
+  const handleAudioFile = async (file: File) => {
+    setErrorMessage(null);
+    setIsPlayingOriginal(false);
+    stopPlayingOriginal();
+    clearAudition();
+    setAudioBuffer(null);
+    setStitchedBuffer(null);
+    setSegments([]);
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const audioCtx = new AudioCtx();
+
+      setAnalysisStep("Decoding spoken word audio...");
+      const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      setAudioBuffer(decodedBuffer);
+      setOriginalFile({
+        name: file.name,
+        type: file.type,
+        file: file,
+      });
+      audioCtx.close();
+    } catch (err: any) {
+      console.error("Decoding error:", err);
+      setErrorMessage(
+        "Could not decode audio. Please ensure you are uploading standard MP3, WAV, or M4A audio files, and your browser supports them."
+      );
+    }
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      handleAudioFile(e.target.files[0]);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      handleAudioFile(e.dataTransfer.files[0]);
+    }
+  };
+
+  const handleScriptUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      if (event.target?.result) {
+        setReferenceScript(event.target.result as string);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const triggerAnalyze = async (rangeStart?: number, rangeEnd?: number) => {
+    if (!originalFile || !audioBuffer) return;
+
+    setIsAnalyzing(true);
+    setErrorMessage(null);
+
+    const isPartial = rangeStart !== undefined && rangeEnd !== undefined;
+    const startOffset = isPartial ? rangeStart : 0;
+    const endOffset = isPartial ? rangeEnd : audioBuffer.duration;
+    const duration = endOffset - startOffset;
+
+    if (!isPartial) {
+      setSegments([]);
+    }
+
+    try {
+      const targetChunkDuration = 60; // Sweet spot for optimal model temporal precision
+
+      // 1. Calculate silence-based split points
+      setAnalysisStep(isPartial ? "Analyzing speech waveform structure in selected range..." : "Analyzing speech waveform structure...");
+      const splits: number[] = [startOffset];
+      let lastSplit = startOffset;
+      while (lastSplit + targetChunkDuration < endOffset - 10) {
+        const targetTime = lastSplit + targetChunkDuration;
+        const quietest = findQuietestTime(audioBuffer, targetTime, 8);
+        splits.push(quietest);
+        lastSplit = quietest;
+      }
+      splits.push(endOffset);
+
+      const totalChunks = splits.length - 1;
+      console.log(`Audio split into ${totalChunks} chunks:`, splits);
+
+      const allRawKeeps: any[] = [];
+      const tempCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+
+      // 2. Process each chunk sequentially
+      for (let i = 0; i < totalChunks; i++) {
+        const start = splits[i];
+        const end = splits[i + 1];
+        const chunkDuration = end - start;
+
+        setAnalysisStep(
+          `Editing segment ${i + 1} of ${totalChunks} (${Math.round(start)}s - ${Math.round(end)}s)...`
+        );
+
+        // Slice out the audio chunk buffer (without fade, to preserve transitions)
+        const slicedBuf = sliceAudioBuffer(tempCtx, audioBuffer, start, end, false);
+        // Encode slice to WAV Blob
+        const wavBlob = audioBufferToWav(slicedBuf);
+
+        // Convert Blob to base64
+        const base64Raw = await new Promise<string>((resolve) => {
+          const r = new FileReader();
+          r.onloadend = () => {
+            const dataUrl = r.result as string;
+            resolve(dataUrl.split(",")[1]);
+          };
+          r.readAsDataURL(wavBlob);
+        });
+
+        // Query backend for this chunk
+        const response = await fetch("/api/analyze-audio", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            audio: base64Raw,
+            mimeType: "audio/wav",
+            script: referenceScript,
+            chunkStart: start,
+            chunkEnd: end,
+          }),
+        });
+
+        if (!response.ok) {
+          const errResponse = await response.json();
+          throw new Error(
+            `Segment ${i + 1} analysis failed: ${errResponse.error || "Server error"}`
+          );
+        }
+
+        const result = await response.json();
+        if (result && Array.isArray(result.keeps)) {
+          // Adjust local relative keeps back to the global timeline
+          const chunkKeeps = result.keeps.map((k: any) => {
+            const rawStart = parseFloat(k.start);
+            const rawEnd = parseFloat(k.end);
+
+            let relativeStart = Math.max(0, Math.min(chunkDuration, isNaN(rawStart) ? 0 : rawStart));
+            let relativeEnd = Math.max(0, Math.min(chunkDuration, isNaN(rawEnd) ? chunkDuration : rawEnd));
+
+            if (relativeStart > relativeEnd) {
+              const temp = relativeStart;
+              relativeStart = relativeEnd;
+              relativeEnd = temp;
+            }
+
+            return {
+              start: start + relativeStart,
+              end: start + relativeEnd,
+              transcript: k.transcript || "[Spoken word Segment]",
+            };
+          });
+
+          allRawKeeps.push(...chunkKeeps);
+        } else {
+          console.warn(`Segment ${i + 1} returned no keep zones.`);
+        }
+      }
+
+      setAnalysisStep("Assembling master timeline...");
+
+      // 3. Post-process the aggregated timeline
+      const formatted: AudioSegment[] = allRawKeeps
+        .map((k: any, idx: number) => ({
+          id: `ai_${idx}_${Date.now()}`,
+          start: k.start,
+          end: k.end,
+          transcript: k.transcript,
+          keep: true,
+        }))
+        .filter((k) => k.end - k.start > 0.05) // Remove empty/tiny fragments
+        .sort((a, b) => a.start - b.start);
+
+      if (!isPartial) {
+        // Gracefully resolve any overlapping keeps by splitting at the overlap midpoint.
+        for (let i = 0; i < formatted.length - 1; i++) {
+          const current = formatted[i];
+          const next = formatted[i + 1];
+
+          if (current.end > next.start) {
+            if (next.start >= current.start && next.end <= current.end) {
+              const mid = next.start;
+              current.end = mid;
+              next.start = mid;
+            } else {
+              const overlapMid = (current.end + next.start) / 2;
+              current.end = overlapMid;
+              next.start = overlapMid;
+            }
+          }
+        }
+
+        const resolvedFormatted = formatted.filter((k) => k.end - k.start > 0.05);
+
+        // Construct discards automatically between keeps
+        const completeTimeline: AudioSegment[] = [];
+        let lastPos = 0;
+
+        resolvedFormatted.forEach((kSeg, idx) => {
+          if (kSeg.start < lastPos) {
+            kSeg.start = lastPos;
+          }
+
+          // Only insert a discard if there is a gap greater than 0.3 seconds
+          if (kSeg.start > lastPos + 0.3) {
+            completeTimeline.push({
+              id: `discard_${idx}_${Date.now()}`,
+              start: lastPos,
+              end: kSeg.start,
+              transcript: "[Mistake, repetition, or silent pause edited out]",
+              keep: false,
+            });
+          }
+
+          if (kSeg.end > kSeg.start) {
+            completeTimeline.push(kSeg);
+            lastPos = kSeg.end;
+          }
+        });
+
+        if (audioBuffer.duration > lastPos + 0.3) {
+          completeTimeline.push({
+            id: `discard_end_${Date.now()}`,
+            start: lastPos,
+            end: audioBuffer.duration,
+            transcript: "[Room tone or tail silence cut]",
+            keep: false,
+          });
+        }
+
+        setSegments(completeTimeline.sort((a, b) => a.start - b.start));
+      } else {
+        // --- Partial / Range re-analysis code path ---
+        // 1. Remove/clip existing segments overlapping with the range [startOffset, endOffset]
+        const remainingSegments: AudioSegment[] = [];
+
+        segments.forEach((seg) => {
+          // Case A: completely outside the re-analyzed range
+          if (seg.end <= startOffset || seg.start >= endOffset) {
+            remainingSegments.push(seg);
+          }
+          // Case B: segment completely inside the range -> discard it
+          else if (seg.start >= startOffset && seg.end <= endOffset) {
+            // Drop it, we have fresh analysis for this space
+          }
+          // Case C: overlaps left side (starts before range, ends inside range)
+          else if (seg.start < startOffset && seg.end > startOffset && seg.end <= endOffset) {
+            remainingSegments.push({
+              ...seg,
+              end: startOffset,
+            });
+          }
+          // Case D: overlaps right side (starts inside range, ends after range)
+          else if (seg.start >= startOffset && seg.start < endOffset && seg.end > endOffset) {
+            remainingSegments.push({
+              ...seg,
+              start: endOffset,
+            });
+          }
+          // Case E: segment spans across the entire range (starts before range, ends after range)
+          else if (seg.start < startOffset && seg.end > endOffset) {
+            remainingSegments.push({
+              ...seg,
+              id: `${seg.id}_left`,
+              end: startOffset,
+            });
+            remainingSegments.push({
+              ...seg,
+              id: `${seg.id}_right`,
+              start: endOffset,
+            });
+          }
+        });
+
+        // 2. Add the newly analyzed keeps inside the range
+        // If the new formatted keeps are empty, we'll cover the whole range as a discard/cut.
+        // Let's resolve overlaps within the fresh keeps first.
+        for (let i = 0; i < formatted.length - 1; i++) {
+          const current = formatted[i];
+          const next = formatted[i + 1];
+          if (current.end > next.start) {
+            const overlapMid = (current.end + next.start) / 2;
+            current.end = overlapMid;
+            next.start = overlapMid;
+          }
+        }
+
+        const freshKeeps = formatted.filter((k) => k.end - k.start > 0.05);
+
+        // 3. Construct local keeps and fill gaps with discard/cut segments inside [startOffset, endOffset]
+        const localRangeTimeline: AudioSegment[] = [];
+        let rangeLastPos = startOffset;
+
+        freshKeeps.forEach((kSeg, idx) => {
+          if (kSeg.start < rangeLastPos) {
+            kSeg.start = rangeLastPos;
+          }
+
+          if (kSeg.start > rangeLastPos + 0.3) {
+            localRangeTimeline.push({
+              id: `discard_range_${idx}_${Date.now()}`,
+              start: rangeLastPos,
+              end: kSeg.start,
+              transcript: "[Mistake, repetition, or silent pause edited out]",
+              keep: false,
+            });
+          }
+
+          if (kSeg.end > kSeg.start) {
+            localRangeTimeline.push(kSeg);
+            rangeLastPos = kSeg.end;
+          }
+        });
+
+        if (endOffset > rangeLastPos + 0.3) {
+          localRangeTimeline.push({
+            id: `discard_range_end_${Date.now()}`,
+            start: rangeLastPos,
+            end: endOffset,
+            transcript: "[Edited out]",
+            keep: false,
+          });
+        }
+
+        // Combine and sort
+        const combined = [...remainingSegments, ...localRangeTimeline].sort((a, b) => a.start - b.start);
+        setSegments(combined);
+        setSelectionStart(null);
+        setSelectionEnd(null);
+      }
+    } catch (err: any) {
+      console.error("Processing error:", err);
+      setErrorMessage(err.message || "An error occurred during speech analysis.");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  // Original Playback triggers
+  const startPlayingOriginal = (offset = 0) => {
+    if (!audioBuffer) return;
+    stopPlayingOriginal();
+    clearAudition();
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const audioCtx = new AudioCtx();
+      originalAudioCtxRef.current = audioCtx;
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioCtx.destination);
+
+      source.start(0, offset);
+      originalSourceRef.current = source;
+      setIsPlayingOriginal(true);
+      setCurrentTimeOriginal(offset);
+      originalStartRealTimeRef.current = audioCtx.currentTime - offset;
+
+      originalIntervalRef.current = window.setInterval(() => {
+        if (!originalAudioCtxRef.current) return;
+        const elapsed = originalAudioCtxRef.current.currentTime - originalStartRealTimeRef.current;
+        if (elapsed >= audioBuffer.duration) {
+          stopPlayingOriginal();
+          setCurrentTimeOriginal(audioBuffer.duration);
+        } else {
+          setCurrentTimeOriginal(elapsed);
+        }
+      }, 50);
+
+      source.onended = () => {
+        // Automatically handled by elapsed check
+      };
+    } catch (e) {
+      console.error("Playback start error", e);
+    }
+  };
+
+  const stopPlayingOriginal = () => {
+    if (originalSourceRef.current) {
+      try {
+        originalSourceRef.current.stop();
+      } catch (e) {}
+      originalSourceRef.current = null;
+    }
+    if (originalIntervalRef.current) {
+      clearInterval(originalIntervalRef.current);
+      originalIntervalRef.current = null;
+    }
+    if (originalAudioCtxRef.current) {
+      originalAudioCtxRef.current.close();
+      originalAudioCtxRef.current = null;
+    }
+    setIsPlayingOriginal(false);
+  };
+
+  const handleOriginalSeek = (time: number) => {
+    setCurrentTimeOriginal(time);
+    if (isPlayingOriginal) {
+      startPlayingOriginal(time);
+    }
+  };
+
+  // ==========================================
+  // AI VOICE PATCH / SPEECH SYNTHESIS ENGINE
+  // ==========================================
+  const handlePatchSegment = (seg: AudioSegment) => {
+    stopPlayingOriginal();
+    clearAudition();
+    stopPatchPreview();
+    stopVoicePreview();
+    setPatchingSegment(seg);
+    setPatchText(seg.transcript || "");
+    setPatchPreviewBuffer(null);
+    setPatchError(null);
+    setVocalMode("clone"); // Default to smart speaker clone on load
+  };
+
+  const handleRemovePatch = (seg: AudioSegment) => {
+    setSegments((prev) =>
+      prev.map((s) => {
+        if (s.id === seg.id) {
+          const { customBuffer, isPatched, ...rest } = s;
+          return { ...rest, keep: s.keep };
+        }
+        return s;
+      })
+    );
+  };
+
+  const handlePreviewVoiceArchetype = async () => {
+    if (isGeneratingVoicePreview) return;
+    stopPatchPreview();
+    stopPlayingOriginal();
+    clearAudition();
+    
+    if (playingVoicePreviewName === selectedVoice) {
+      stopVoicePreview();
+      return;
+    }
+
+    stopVoicePreview();
+    setIsGeneratingVoicePreview(true);
+    setPlayingVoicePreviewName(selectedVoice);
+
+    try {
+      const sampleTexts: Record<string, string> = {
+        Puck: "Hi! I am Puck. I offer an energetic, friendly, and expressive voice preset.",
+        Zephyr: "Hello! I am Zephyr. I offer a clear, warm, and engaging voice style.",
+        Kore: "Greetings! I am Kore. I offer a warm, rich, and professional vocal quality.",
+        Fenrir: "Hello. I am Fenrir, featuring a deep, resonant, and steady masculine voice.",
+        Charon: "Welcome. This is Charon, with a calm, articulate, and composed voice archetype."
+      };
+
+      const text = sampleTexts[selectedVoice] || `Hello, I am the Gemini voice preset ${selectedVoice}.`;
+
+      const response = await fetch("/api/generate-patch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          textToSpeak: text,
+          voicePreset: selectedVoice,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to generate voice preview");
+      }
+
+      const result = await response.json();
+      if (!result.audio) {
+        throw new Error("No audio returned from backend");
+      }
+
+      const binaryString = window.atob(result.audio);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const decCtx = new AudioCtx();
+      try {
+        const decoded = await decCtx.decodeAudioData(bytes.buffer);
+        
+        const audioCtx = new AudioCtx();
+        voicePreviewCtxRef.current = audioCtx;
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = decoded;
+        source.connect(audioCtx.destination);
+        source.start(0);
+
+        voicePreviewSourceRef.current = source;
+        source.onended = () => {
+          setPlayingVoicePreviewName(null);
+        };
+      } finally {
+        decCtx.close();
+      }
+    } catch (err: any) {
+      console.error("Failed to preview voice archetype", err);
+      setPatchError(err.message || "Failed to fetch or play vocal style preview.");
+      setPlayingVoicePreviewName(null);
+    } finally {
+      setIsGeneratingVoicePreview(false);
+    }
+  };
+
+  const handleGeneratePatch = async () => {
+    if (!patchingSegment || !patchText.trim()) return;
+    setIsGeneratingPatch(true);
+    setPatchError(null);
+    stopPatchPreview();
+    stopVoicePreview();
+
+    try {
+      let referenceAudioBase64 = "";
+      const shouldSendReference = (vocalMode === "clone" || (vocalMode === "archetype" && useVocalReference));
+
+      if (shouldSendReference && audioBuffer) {
+        // Slice and convert reference audio
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        const tempCtx = new AudioCtx();
+        try {
+          // Slice the current segment
+          const sliced = sliceAudioBuffer(tempCtx, audioBuffer, patchingSegment.start, patchingSegment.end, false);
+          const wavBlob = audioBufferToWav(sliced);
+          referenceAudioBase64 = await new Promise<string>((resolve) => {
+            const r = new FileReader();
+            r.onloadend = () => {
+              resolve((r.result as string).split(",")[1]);
+            };
+            r.readAsDataURL(wavBlob);
+          });
+        } finally {
+          tempCtx.close();
+        }
+      }
+
+      const response = await fetch("/api/generate-patch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          referenceAudio: referenceAudioBase64 || undefined,
+          mimeType: referenceAudioBase64 ? "audio/wav" : undefined,
+          textToSpeak: patchText,
+          voicePreset: selectedVoice,
+        }),
+      });
+
+      if (!response.ok) {
+        const errJson = await response.json();
+        throw new Error(errJson.error || "Failed to generate AI vocal patch.");
+      }
+
+      const result = await response.json();
+      if (!result.audio) {
+        throw new Error("No audio returned from backend.");
+      }
+
+      // Convert base64 back to AudioBuffer
+      const binaryString = window.atob(result.audio);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const decCtx = new AudioCtx();
+      try {
+        const decoded = await decCtx.decodeAudioData(bytes.buffer);
+        setPatchPreviewBuffer(decoded);
+      } finally {
+        decCtx.close();
+      }
+    } catch (err: any) {
+      console.error(err);
+      setPatchError(err.message || "An error occurred during speech generation.");
+    } finally {
+      setIsGeneratingPatch(false);
+    }
+  };
+
+  const handleApplyPatch = () => {
+    if (!patchingSegment || !patchPreviewBuffer) return;
+    setSegments((prev) =>
+      prev.map((s) => {
+        if (s.id === patchingSegment.id) {
+          return {
+            ...s,
+            transcript: patchText,
+            isPatched: true,
+            customBuffer: patchPreviewBuffer,
+          };
+        }
+        return s;
+      })
+    );
+    setPatchingSegment(null);
+    setPatchPreviewBuffer(null);
+  };
+
+  const playPatchPreview = () => {
+    if (!patchPreviewBuffer) return;
+    stopPatchPreview();
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const audioCtx = new AudioCtx();
+      patchPreviewCtxRef.current = audioCtx;
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = patchPreviewBuffer;
+      source.connect(audioCtx.destination);
+      source.start(0);
+
+      patchPreviewSourceRef.current = source;
+      setIsPlayingPatchPreview(true);
+
+      source.onended = () => {
+        setIsPlayingPatchPreview(false);
+      };
+    } catch (e) {
+      console.error("Failed to play preview", e);
+    }
+  };
+
+  const stopPatchPreview = () => {
+    if (patchPreviewSourceRef.current) {
+      try {
+        patchPreviewSourceRef.current.stop();
+      } catch (e) {}
+      patchPreviewSourceRef.current = null;
+    }
+    if (patchPreviewCtxRef.current) {
+      patchPreviewCtxRef.current.close();
+      patchPreviewCtxRef.current = null;
+    }
+    setIsPlayingPatchPreview(false);
+  };
+
+  // Play individual Segment audition
+  const playSegmentOnly = (start: number, end: number) => {
+    if (!audioBuffer) return;
+
+    if (currentlyAuditioning && Math.abs(currentlyAuditioning.start - start) < 0.05 && Math.abs(currentlyAuditioning.end - end) < 0.05) {
+      clearAudition();
+      return;
+    }
+
+    stopPlayingOriginal();
+    clearAudition();
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const audioCtx = new AudioCtx();
+      auditionCtxRef.current = audioCtx;
+
+      const paddedStart = Math.max(0, start - boundaryPadding);
+      const paddedEnd = Math.min(audioBuffer.duration, end + boundaryPadding);
+      const sliced = sliceAudioBuffer(audioCtx, audioBuffer, paddedStart, paddedEnd);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = sliced;
+      source.connect(audioCtx.destination);
+
+      source.start(0);
+      auditionSourceRef.current = source;
+      setCurrentlyAuditioning({ start, end });
+
+      auditionTimeoutRef.current = window.setTimeout(() => {
+        stopAudition();
+      }, sliced.duration * 1000);
+    } catch (e) {
+      console.error("Audition playback failed", e);
+    }
+  };
+
+  const stopAudition = () => {
+    if (auditionSourceRef.current) {
+      try {
+        auditionSourceRef.current.stop();
+      } catch (e) {}
+      auditionSourceRef.current = null;
+    }
+    if (auditionTimeoutRef.current) {
+      clearTimeout(auditionTimeoutRef.current);
+      auditionTimeoutRef.current = null;
+    }
+    if (auditionCtxRef.current) {
+      auditionCtxRef.current.close();
+      auditionCtxRef.current = null;
+    }
+    setCurrentlyAuditioning(null);
+  };
+
+  const clearAudition = () => {
+    stopAudition();
+  };
+
+  const clearWorkspace = () => {
+    stopPlayingOriginal();
+    clearAudition();
+    setOriginalFile(null);
+    setAudioBuffer(null);
+    setStitchedBuffer(null);
+    setSegments([]);
+    setCurrentTimeOriginal(0);
+    setIsPlayingOriginal(false);
+    setSelectionStart(null);
+    setSelectionEnd(null);
+  };
+
+  // Segment adjustment handlers
+  const handleUpdateSegment = (updated: AudioSegment) => {
+    setSegments((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
+  };
+
+  const handleAddSegment = (newSeg: AudioSegment) => {
+    setSegments((prev) => [...prev, newSeg].sort((a, b) => a.start - b.start));
+  };
+
+  const handleDeleteSegment = (id: string) => {
+    setSegments((prev) => prev.filter((s) => s.id !== id));
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-emerald-500 selection:text-slate-950 flex flex-col antialiased">
+      {/* Visual Header */}
+      <header className="border-b border-slate-900 bg-slate-950/80 backdrop-blur-md sticky top-0 z-50 px-6 py-4">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-emerald-500/10 rounded-xl border border-emerald-500/20">
+              <Sparkles className="w-5 h-5 text-emerald-400" />
+            </div>
+            <div>
+              <h1 className="text-base font-bold text-slate-100 tracking-tight flex items-center gap-2">
+                Spoken Word Audio Editor
+                <span className="text-[10px] font-mono font-medium text-emerald-400 bg-emerald-950/60 border border-emerald-900/40 px-2 py-0.5 rounded-full uppercase tracking-wider">
+                  AI-Powered
+                </span>
+              </h1>
+              <p className="text-xs text-slate-400">
+                Automatic detection and non-destructive removal of vocal mistakes, repetitions, and pauses.
+              </p>
+            </div>
+          </div>
+
+          {originalFile && (
+            <button
+              id="clear-workspace-btn"
+              onClick={clearWorkspace}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-400 hover:text-slate-200 hover:bg-slate-900 border border-transparent hover:border-slate-800 rounded-lg transition-all cursor-pointer"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Clear Session</span>
+            </button>
+          )}
+        </div>
+      </header>
+
+      {/* Main Studio Workspace Grid */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-6">
+        {/* Workspace Greeting when nothing is loaded */}
+        {!originalFile ? (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 items-stretch">
+            {/* Left side upload */}
+            <div className="lg:col-span-7 flex flex-col justify-between p-8 bg-slate-900/40 rounded-2xl border border-slate-800/80 backdrop-blur-md">
+              <div className="w-full">
+                <div className="flex gap-1 border-b border-slate-800/80 pb-4 mb-6">
+                  <button
+                    onClick={() => setActiveTab("upload")}
+                    className={`flex items-center gap-2 px-4 py-2 text-xs font-semibold uppercase tracking-wider rounded-lg transition-all cursor-pointer ${
+                      activeTab === "upload"
+                        ? "bg-slate-800 text-slate-100 border border-slate-700"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <Upload className="w-4 h-4" />
+                    <span>Upload Recording</span>
+                  </button>
+                  <button
+                    onClick={() => setActiveTab("record")}
+                    className={`flex items-center gap-2 px-4 py-2 text-xs font-semibold uppercase tracking-wider rounded-lg transition-all cursor-pointer ${
+                      activeTab === "record"
+                        ? "bg-slate-800 text-slate-100 border border-slate-700"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <Mic className="w-4 h-4" />
+                    <span>Live Studio Record</span>
+                  </button>
+                </div>
+
+                {/* Optional Reference Script Card */}
+                <div className="mb-6 bg-slate-950/40 border border-slate-800/80 rounded-xl p-4 shadow-inner">
+                  <div className="flex items-center justify-between mb-2">
+                    <label htmlFor="reference-script-area" className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                      <BookOpen className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Reference Script <span className="text-slate-500 font-normal">(Optional)</span></span>
+                    </label>
+                    <div className="flex items-center gap-3">
+                      <label htmlFor="script-file-loader" className="text-[10px] text-emerald-400 hover:text-emerald-300 cursor-pointer flex items-center gap-1 font-mono">
+                        <FileText className="w-3 h-3" />
+                        <span>Upload .txt script</span>
+                        <input
+                          id="script-file-loader"
+                          type="file"
+                          accept=".txt"
+                          onChange={handleScriptUpload}
+                          className="hidden"
+                        />
+                      </label>
+                      {referenceScript && (
+                        <button
+                          type="button"
+                          onClick={() => setReferenceScript("")}
+                          className="text-[10px] text-red-400 hover:text-red-300 font-mono"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <textarea
+                    id="reference-script-area"
+                    placeholder="Paste or type the intended text/script here. Gemini will use this to align the audio perfectly and precisely edit out errors, repetitions, or stutters..."
+                    value={referenceScript}
+                    onChange={(e) => setReferenceScript(e.target.value)}
+                    rows={3}
+                    className="w-full bg-slate-900/50 border border-slate-800 focus:border-emerald-500/50 rounded-lg p-2.5 text-xs text-slate-300 placeholder-slate-600 focus:outline-none transition-colors resize-y font-sans leading-relaxed"
+                  />
+                  <div className="flex justify-between items-center mt-1.5 text-[10px] text-slate-500 font-mono">
+                    <span>Helps Gemini match words & prevent cutoffs</span>
+                    <span>{referenceScript.length} chars</span>
+                  </div>
+                </div>
+
+                {activeTab === "upload" ? (
+                  <div
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={handleDrop}
+                    className="flex flex-col items-center justify-center border border-dashed border-slate-800 hover:border-slate-700 bg-slate-950/60 rounded-xl p-12 text-center transition-all cursor-pointer group"
+                  >
+                    <input
+                      type="file"
+                      id="audio-uploader"
+                      accept="audio/*"
+                      onChange={handleFileUpload}
+                      className="hidden"
+                    />
+                    <label htmlFor="audio-uploader" className="cursor-pointer w-full flex flex-col items-center">
+                      <div className="p-4 bg-slate-900 border border-slate-800 rounded-2xl text-slate-400 group-hover:text-slate-200 group-hover:bg-slate-800/60 group-hover:border-slate-700 transition-all mb-4 shadow-inner">
+                        <Upload className="w-6 h-6" />
+                      </div>
+                      <span className="text-sm font-semibold text-slate-200 group-hover:text-white transition-colors mb-1">
+                        Select audio file from disk
+                      </span>
+                      <span className="text-xs text-slate-400 max-w-sm">
+                        Supports MP3, WAV, or M4A vocal recordings. Or drag & drop the file directly here.
+                      </span>
+                    </label>
+                  </div>
+                ) : (
+                  <div className="py-6">
+                    <AudioRecorder onRecordingComplete={(blob) => handleAudioFile(new File([blob], "studio_record.webm", { type: "audio/webm" }))} />
+                  </div>
+                )}
+              </div>
+
+              {errorMessage && (
+                <div className="flex items-start gap-3 bg-red-950/30 p-4 rounded-xl border border-red-900/40 text-xs text-red-300 mt-6 shadow-inner">
+                  <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Right side instruction/Quick Test */}
+            <div className="lg:col-span-5 flex flex-col justify-between p-8 bg-slate-900/60 rounded-2xl border border-slate-800/80 backdrop-blur-md">
+              <div className="flex flex-col gap-6">
+                <div className="flex items-center gap-2 text-slate-300 font-semibold border-b border-slate-800/80 pb-3">
+                  <BookOpen className="w-4.5 h-4.5 text-emerald-400" />
+                  <span className="text-sm uppercase tracking-wide">How to Test it Instantly</span>
+                </div>
+
+                <div className="flex flex-col gap-5 text-xs text-slate-400 leading-relaxed">
+                  <p>
+                    This editor is fine-tuned to solve a common spoken word and podcasting dilemma: **stutter starts, misspoken sentences, and immediate retakes**.
+                  </p>
+
+                  <div className="bg-slate-950/80 rounded-xl p-4 border border-slate-800 shadow-inner">
+                    <h4 className="text-xs font-bold text-slate-200 mb-2 uppercase tracking-wide flex items-center gap-1.5">
+                      <Mic className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+                      Recommended Quick Script
+                    </h4>
+                    <p className="italic bg-slate-900/50 p-2.5 rounded border border-slate-800/40 text-slate-300 leading-relaxed font-serif">
+                      "I love doing spoken word recordings. When I make a mistake, I simply stop... [pause 1 sec]... I simply stop, go back, and repeat the correct sentence line. Perfect!"
+                    </p>
+                  </div>
+
+                  <ol className="list-decimal list-inside flex flex-col gap-3 ml-1">
+                    <li>
+                      Select <strong className="text-slate-300">Live Studio Record</strong> above.
+                    </li>
+                    <li>
+                      Read the script, purposely reading the duplicate parts.
+                    </li>
+                    <li>
+                      Stop, and click <strong className="text-emerald-400">Analyze with Gemini AI</strong>.
+                    </li>
+                    <li>
+                      Gemini will automatically slice the vocal track, cross out the mistakes, and stitch the clean takes into a perfect seamless download!
+                    </li>
+                  </ol>
+                </div>
+              </div>
+
+              <div className="text-[10px] font-mono text-slate-500 text-center border-t border-slate-800/40 pt-4 mt-6">
+                100% Secure. File parsing and stitching happens locally.
+              </div>
+            </div>
+          </div>
+        ) : (
+          /* Active Editing Workspace */
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            {/* LEFT COLUMN: Source Audio & Timestamps */}
+            <div className="lg:col-span-6 flex flex-col gap-6">
+              {/* Audio Source Status */}
+              <div className="p-5 bg-slate-900/40 rounded-2xl border border-slate-800/80 backdrop-blur-sm flex flex-col gap-4">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                  <div className="flex items-center gap-2">
+                    <Music className="w-4.5 h-4.5 text-slate-400" />
+                    <span className="text-xs font-semibold text-slate-300 truncate max-w-[240px]">
+                      {originalFile.name}
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-500 lowercase bg-slate-950 px-2 py-0.5 rounded border border-slate-800/80">
+                      {Math.round(originalFile.file.size / 1024)} KB
+                    </span>
+                  </div>
+
+                  <button
+                    onClick={clearWorkspace}
+                    className="text-[10px] font-mono text-red-400 hover:text-red-300 transition-colors uppercase tracking-wide cursor-pointer"
+                  >
+                    Discard Audio
+                  </button>
+                </div>
+
+                 {/* Original Waveform Canvas */}
+                <WaveformVisualizer
+                  audioBuffer={audioBuffer}
+                  segments={segments}
+                  currentTime={currentTimeOriginal}
+                  onSeek={handleOriginalSeek}
+                  selectionStart={selectionStart}
+                  selectionEnd={selectionEnd}
+                  onSelectionChange={(start, end) => {
+                    setSelectionStart(start);
+                    setSelectionEnd(end);
+                  }}
+                />
+
+                {/* Audio controls for original/raw audio */}
+                <div className="flex items-center justify-between gap-4 mt-1">
+                  <div className="flex items-center gap-2">
+                    <button
+                      id="original-play-btn"
+                      onClick={() => (isPlayingOriginal ? stopPlayingOriginal() : startPlayingOriginal(currentTimeOriginal))}
+                      className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-100 rounded-lg text-xs font-semibold border border-slate-700 cursor-pointer"
+                    >
+                      {isPlayingOriginal ? (
+                        <>
+                          <Pause className="w-3.5 h-3.5 fill-slate-100" />
+                          <span>Pause Audio</span>
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-3.5 h-3.5 fill-slate-100 ml-0.5" />
+                          <span>Audition Original</span>
+                        </>
+                      )}
+                    </button>
+
+                    {currentTimeOriginal > 0 && (
+                      <button
+                        id="original-stop-btn"
+                        onClick={stopPlayingOriginal}
+                        className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-slate-200 cursor-pointer"
+                      >
+                        <Square className="w-3.5 h-3.5 fill-current" />
+                      </button>
+                    )}
+                  </div>
+
+                  {!isAnalyzing && (
+                    <div className="flex items-center gap-2">
+                      {selectionStart !== null && selectionEnd !== null ? (
+                        <>
+                          <button
+                            onClick={() => {
+                              setSelectionStart(null);
+                              setSelectionEnd(null);
+                            }}
+                            className="px-3 py-2 text-slate-400 hover:text-slate-200 text-xs font-semibold cursor-pointer"
+                          >
+                            Clear Selection
+                          </button>
+                          <button
+                            id="analyze-selection-btn"
+                            onClick={() => triggerAnalyze(selectionStart, selectionEnd)}
+                            className="flex items-center gap-1.5 px-4 py-2 bg-sky-500 hover:bg-sky-400 active:bg-sky-600 text-slate-950 font-bold rounded-lg text-xs tracking-wide shadow-md shadow-sky-500/10 cursor-pointer animate-bounce"
+                            title="Retry Gemini analysis only on highlighted timeline section"
+                          >
+                            <Sparkles className="w-3.5 h-3.5 fill-slate-950" />
+                            <span>Retry Selection ({Math.round(selectionStart)}s - {Math.round(selectionEnd)}s)</span>
+                          </button>
+                        </>
+                      ) : segments.length > 0 ? (
+                        <button
+                          id="reanalyze-btn"
+                          onClick={() => triggerAnalyze()}
+                          className="flex items-center gap-1.5 px-4 py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-300 hover:text-white font-semibold rounded-lg text-xs tracking-wide border border-slate-700 cursor-pointer"
+                          title="Retry analysis and cutting on the full audio timeline"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Re-analyze Full Audio</span>
+                        </button>
+                      ) : (
+                        <button
+                          id="analyze-btn"
+                          onClick={() => triggerAnalyze()}
+                          className="flex items-center gap-2 px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-slate-950 font-bold rounded-lg text-xs tracking-wide shadow-md shadow-emerald-500/10 cursor-pointer"
+                        >
+                          <Sparkles className="w-4 h-4 fill-slate-950" />
+                          <span>Analyze & Edit with Gemini AI</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Splice Boundary Padding Settings */}
+                <div className="border-t border-slate-800/60 pt-4 mt-2">
+                  <div className="flex items-center justify-between gap-4 mb-2">
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-xs font-semibold text-slate-300">Splice Boundary Cushion</span>
+                      <span className="text-[10px] text-slate-500">
+                        Adds a safety buffer around slices to prevent clipped words and keep timing natural.
+                      </span>
+                    </div>
+                    <span className="text-xs font-mono font-bold text-emerald-400 bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-900/40">
+                      {boundaryPadding.toFixed(2)}s
+                    </span>
+                  </div>
+                  <input
+                    id="boundary-padding-slider"
+                    type="range"
+                    min="0"
+                    max="0.5"
+                    step="0.05"
+                    value={boundaryPadding}
+                    onChange={(e) => setBoundaryPadding(parseFloat(e.target.value))}
+                    className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-400"
+                  />
+                  <div className="flex justify-between text-[9px] font-mono text-slate-500 mt-1">
+                    <span>0.0s (Tight)</span>
+                    <span>0.15s (Default)</span>
+                    <span>0.3s (Spacious)</span>
+                    <span>0.5s (Breath-in)</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Loader Panel during Gemini analysis */}
+              {isAnalyzing && (
+                <div className="p-8 bg-slate-900/60 rounded-2xl border border-slate-800 flex flex-col items-center justify-center text-center gap-4">
+                  <div className="relative">
+                    <div className="w-12 h-12 rounded-full border-4 border-slate-800 border-t-emerald-500 animate-spin" />
+                    <Sparkles className="w-5 h-5 text-emerald-400 absolute inset-0 m-auto animate-pulse" />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <span className="text-xs font-mono text-emerald-400 uppercase tracking-widest animate-pulse">
+                      Processing Spoken Word
+                    </span>
+                    <p className="text-sm font-semibold text-slate-200">{analysisStep}</p>
+                    <span className="text-[10px] text-slate-500 max-w-xs mt-1 leading-relaxed">
+                      Gemini listens directly to the recording, transcribes takes, and locates the exact seconds containing mistakes.
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {errorMessage && (
+                <div className="flex items-start gap-3 bg-red-950/30 p-4 rounded-xl border border-red-900/40 text-xs text-red-300 shadow-inner">
+                  <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+
+              {/* Segment Slices display panel */}
+              {segments.length > 0 && (
+                <div className="p-5 bg-slate-900/30 rounded-2xl border border-slate-900 flex flex-col gap-4">
+                  <SegmentList
+                    segments={segments}
+                    originalDuration={audioBuffer?.duration || 0}
+                    onUpdateSegment={handleUpdateSegment}
+                    onAddSegment={handleAddSegment}
+                    onDeleteSegment={handleDeleteSegment}
+                    onPlaySegmentOnly={playSegmentOnly}
+                    currentlyAuditioning={currentlyAuditioning}
+                    onPatchSegment={handlePatchSegment}
+                    onRemovePatch={handleRemovePatch}
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* RIGHT COLUMN: Clean Stitched Master Track */}
+            <div className="lg:col-span-6 flex flex-col gap-6">
+              <CleanAudioPlayer
+                stitchedBuffer={stitchedBuffer}
+                onPlay={() => {
+                  stopPlayingOriginal();
+                  clearAudition();
+                }}
+                isAnyOtherPlaying={isPlayingOriginal || currentlyAuditioning !== null}
+              />
+
+              <div className="p-5 bg-slate-900/40 rounded-2xl border border-slate-800/80 backdrop-blur-sm flex flex-col gap-4 leading-relaxed text-xs text-slate-400">
+                <h4 className="font-semibold text-slate-200 flex items-center gap-1.5 uppercase tracking-wide text-[10px] border-b border-slate-800 pb-2">
+                  <BookOpen className="w-4 h-4 text-emerald-400" />
+                  Workspace Guide & Control Features
+                </h4>
+                <ul className="flex flex-col gap-2.5 list-disc list-inside ml-1">
+                  <li>
+                    <strong>Toggle Slices</strong>: Check/uncheck any segment in the list. The final audio compiles and adjusts **reactively inside your browser** within milliseconds.
+                  </li>
+                  <li>
+                    <strong>Fine-tuning Boundaries</strong>: Click the pencil icon on any segment to edit its start and end timing precisely, perfect for snug verbal transitions.
+                  </li>
+                  <li>
+                    <strong>Waveform Dragging</strong>: Click on the original timeline waveform to instantly jump your audition cursor.
+                  </li>
+                  <li>
+                    <strong>Lossless WAV Export</strong>: Clicking "Export Clean Master" generates and packages your final take directly on your machine with no extra server wait time.
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* AI Voice Patch Studio Modal Overlay */}
+      {patchingSegment && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 z-50 overflow-y-auto animate-fade-in">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-xl p-6 shadow-2xl flex flex-col gap-5">
+            {/* Header */}
+            <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-5 h-5 text-emerald-400 animate-pulse" />
+                <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wide">
+                  AI Vocal Patch Studio
+                </h3>
+              </div>
+              <button
+                onClick={() => {
+                  stopPatchPreview();
+                  stopVoicePreview();
+                  setPatchingSegment(null);
+                }}
+                className="text-slate-400 hover:text-white font-mono text-xs cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+
+            {/* Segment stats info */}
+            <div className="bg-slate-950/60 rounded-xl p-3 border border-slate-800/80 flex items-center justify-between text-xs">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">Patching Segment</span>
+                <span className="font-mono text-slate-300">
+                  {patchingSegment.start.toFixed(2)}s – {patchingSegment.end.toFixed(2)}s
+                </span>
+              </div>
+              <div className="text-right flex flex-col gap-0.5">
+                <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">Original Duration</span>
+                <span className="font-mono text-emerald-400">
+                  {(patchingSegment.end - patchingSegment.start).toFixed(2)}s
+                </span>
+              </div>
+            </div>
+
+            {/* Settings Form */}
+            <div className="flex flex-col gap-5">
+              {/* Voice Patch Mode Tabs */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[10px] font-mono uppercase tracking-wider text-slate-400">
+                  Vocal Synthesis Method
+                </label>
+                <div className="grid grid-cols-2 gap-2 bg-slate-950 p-1 rounded-xl border border-slate-800">
+                  <button
+                    onClick={() => {
+                      setVocalMode("clone");
+                      stopVoicePreview();
+                    }}
+                    className={`py-2 px-3 text-xs font-semibold rounded-lg transition-all flex flex-col items-center justify-center gap-1 cursor-pointer ${
+                      vocalMode === "clone"
+                        ? "bg-slate-800 border border-slate-700/80 text-emerald-400 font-bold"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <span>🎙️ Speaker Clone</span>
+                    <span className="text-[9px] font-normal text-slate-500 lowercase">no archetype profile</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setVocalMode("archetype");
+                    }}
+                    className={`py-2 px-3 text-xs font-semibold rounded-lg transition-all flex flex-col items-center justify-center gap-1 cursor-pointer ${
+                      vocalMode === "archetype"
+                        ? "bg-slate-800 border border-slate-700/80 text-emerald-400 font-bold"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <span>🎭 Voice Archetype</span>
+                    <span className="text-[9px] font-normal text-slate-500 lowercase">prebuilt system voices</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Dynamic Content Based on Selected Tab */}
+              {vocalMode === "clone" ? (
+                /* Mode A: Speaker Clone */
+                <div className="flex flex-col gap-4 animate-fade-in bg-slate-950/40 border border-slate-900 rounded-xl p-4">
+                  <div className="flex flex-col gap-1">
+                    <p className="text-xs font-semibold text-slate-200">
+                      Intelligent 1:1 Voice Matching
+                    </p>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      This option builds a custom voice print exclusively from the current segment's waveform. It will match your pronunciation style, microphone characteristics, and ambient background room noise for seamless integration.
+                    </p>
+                  </div>
+
+                  {/* Register selection - since Gemini requires a base register preset to run stable style transfer */}
+                  <div className="flex flex-col gap-1.5 pt-2 border-t border-slate-900">
+                    <label className="text-[10px] font-mono uppercase tracking-wider text-slate-400 flex items-center justify-between">
+                      <span>Vocal Pitch Alignment (Base Register)</span>
+                      <span className="text-[9px] text-slate-500 lowercase normal-case font-sans">Helps stabilizer generate clean output</span>
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        onClick={() => {
+                          setSelectedVoice("Puck");
+                          stopVoicePreview();
+                        }}
+                        className={`py-1.5 px-2.5 text-xs font-medium rounded-lg border transition-all cursor-pointer ${
+                          selectedVoice === "Puck"
+                            ? "bg-emerald-950/20 border-emerald-500/40 text-emerald-400"
+                            : "bg-slate-950 border-slate-800/80 text-slate-400 hover:border-slate-700 hover:text-slate-200"
+                        }`}
+                      >
+                        Masculine Pitch Register
+                      </button>
+                      <button
+                        onClick={() => {
+                          setSelectedVoice("Zephyr");
+                          stopVoicePreview();
+                        }}
+                        className={`py-1.5 px-2.5 text-xs font-medium rounded-lg border transition-all cursor-pointer ${
+                          selectedVoice === "Zephyr"
+                            ? "bg-emerald-950/20 border-emerald-500/40 text-emerald-400"
+                            : "bg-slate-950 border-slate-800/80 text-slate-400 hover:border-slate-700 hover:text-slate-200"
+                        }`}
+                      >
+                        Feminine Pitch Register
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                /* Mode B: Voice Archetype */
+                <div className="flex flex-col gap-4 animate-fade-in bg-slate-950/40 border border-slate-900 rounded-xl p-4">
+                  <div className="flex flex-col gap-1">
+                    <p className="text-xs font-semibold text-slate-200">
+                      Standard Professional Narrator
+                    </p>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      Speak the new script using one of Gemini's highly optimized, prebuilt voice actor profiles. Excellent for clean narration or multi-voice scenes.
+                    </p>
+                  </div>
+
+                  {/* Archetype Selector with Play Preview Button */}
+                  <div className="flex flex-col gap-2">
+                    <label className="text-[10px] font-mono uppercase tracking-wider text-slate-400">
+                      Select Vocal Style Archetype
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={selectedVoice}
+                        onChange={(e) => {
+                          setSelectedVoice(e.target.value as any);
+                          stopVoicePreview();
+                        }}
+                        className="flex-1 bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-200 focus:border-emerald-500/50 focus:outline-none cursor-pointer transition-colors"
+                      >
+                        <option value="Puck">Puck (Energetic, friendly male)</option>
+                        <option value="Zephyr">Zephyr (Clear, warm female)</option>
+                        <option value="Kore">Kore (Warm, rich female)</option>
+                        <option value="Fenrir">Fenrir (Deep, resonant male)</option>
+                        <option value="Charon">Charon (Professional, articulate male)</option>
+                      </select>
+
+                      <button
+                        onClick={handlePreviewVoiceArchetype}
+                        disabled={isGeneratingVoicePreview}
+                        className={`px-3 py-2.5 rounded-lg border flex items-center justify-center gap-1.5 text-xs font-semibold cursor-pointer transition-all ${
+                          playingVoicePreviewName === selectedVoice
+                            ? "bg-amber-600 border-amber-500 text-white hover:bg-amber-500"
+                            : isGeneratingVoicePreview
+                            ? "bg-slate-900 border-slate-800 text-slate-500 cursor-not-allowed"
+                            : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700 hover:text-emerald-400"
+                        }`}
+                        title="Play immediate audio sample of selected voice profile"
+                      >
+                        {playingVoicePreviewName === selectedVoice ? (
+                          <>
+                            <Square className="w-3.5 h-3.5 fill-current" />
+                            <span>Stop</span>
+                          </>
+                        ) : isGeneratingVoicePreview ? (
+                          <>
+                            <div className="w-3 h-3 rounded-full border-2 border-slate-700 border-t-emerald-400 animate-spin" />
+                            <span>Loading</span>
+                          </>
+                        ) : (
+                          <>
+                            <Volume2 className="w-3.5 h-3.5" />
+                            <span>Sample</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Optional Reference Checkbox for Environment Match */}
+                  <div className="flex items-start gap-3 bg-slate-950/30 p-2.5 rounded-lg border border-slate-900/60 mt-1">
+                    <input
+                      id="use-vocal-reference"
+                      type="checkbox"
+                      checked={useVocalReference}
+                      onChange={(e) => setUseVocalReference(e.target.checked)}
+                      className="mt-0.5 w-4 h-4 rounded border-slate-800 bg-slate-900 text-emerald-500 focus:ring-emerald-500/30 cursor-pointer"
+                    />
+                    <div className="flex flex-col gap-0.5">
+                      <label htmlFor="use-vocal-reference" className="text-xs font-semibold text-slate-200 cursor-pointer">
+                        Match Timeline Recording Room Acoustics
+                      </label>
+                      <p className="text-[10px] text-slate-500 leading-relaxed">
+                        Feeds your environment & background profile to the archetype. This molds the professional reader to perfectly match your ambient volume, gain, and mic background hiss.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Text Area */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[10px] font-mono uppercase tracking-wider text-slate-400">
+                  Patch Script Content (Words to Speak)
+                </label>
+                <textarea
+                  placeholder="Type the exact text you want Gemini to say..."
+                  value={patchText}
+                  onChange={(e) => setPatchText(e.target.value)}
+                  rows={3}
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-emerald-500/50 rounded-lg p-2.5 text-xs text-slate-300 placeholder-slate-700 focus:outline-none transition-colors resize-none font-sans leading-relaxed"
+                />
+              </div>
+            </div>
+
+            {/* Error displays */}
+            {patchError && (
+              <div className="flex items-start gap-2.5 bg-red-950/30 p-3 rounded-lg border border-red-900/40 text-xs text-red-300 leading-normal">
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                <span>{patchError}</span>
+              </div>
+            )}
+
+            {/* Preview Player / Generation Actions */}
+            <div className="border-t border-slate-800 pt-4 flex flex-col gap-4">
+              {patchPreviewBuffer ? (
+                /* Patch Audition state */
+                <div className="bg-emerald-950/10 border border-emerald-900/30 p-4 rounded-xl flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-[10px] font-mono text-emerald-400 uppercase tracking-widest">
+                        Patch Generated Successfully
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        Duration: <strong className="font-mono text-slate-200">{patchPreviewBuffer.duration.toFixed(2)}s</strong>
+                      </span>
+                    </div>
+
+                    <button
+                      onClick={isPlayingPatchPreview ? stopPatchPreview : playPatchPreview}
+                      className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-semibold cursor-pointer transition-all ${
+                        isPlayingPatchPreview
+                          ? "bg-amber-600 text-white"
+                          : "bg-emerald-600 text-white hover:bg-emerald-500"
+                      }`}
+                    >
+                      {isPlayingPatchPreview ? (
+                        <>
+                          <Square className="w-3.5 h-3.5 fill-current" />
+                          <span>Stop Preview</span>
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-3.5 h-3.5 fill-current" />
+                          <span>Audition Patch</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3 mt-1">
+                    <button
+                      onClick={() => setPatchPreviewBuffer(null)}
+                      className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg border border-slate-700 cursor-pointer transition-all"
+                    >
+                      Regenerate
+                    </button>
+                    <button
+                      onClick={handleApplyPatch}
+                      className="px-3 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-semibold rounded-lg cursor-pointer transition-all"
+                    >
+                      Insert into Timeline
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                /* Primary CTA to trigger speech generation */
+                <button
+                  onClick={handleGeneratePatch}
+                  disabled={isGeneratingPatch || !patchText.trim()}
+                  className={`w-full py-3 rounded-xl flex items-center justify-center gap-2 text-xs font-bold transition-all ${
+                    isGeneratingPatch
+                      ? "bg-slate-800 text-slate-500 cursor-not-allowed"
+                      : "bg-emerald-500 hover:bg-emerald-400 text-slate-950 cursor-pointer"
+                  }`}
+                >
+                  {isGeneratingPatch ? (
+                    <>
+                      <div className="w-4 h-4 rounded-full border-2 border-slate-600 border-t-emerald-400 animate-spin" />
+                      <span>Gemini is synthesizing & style-matching voice...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-4 h-4" />
+                      <span>Generate AI Vocal Patch</span>
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <footer className="border-t border-slate-900 bg-slate-950/60 py-4 text-center text-[10px] font-mono text-slate-500 mt-auto">
+        Powered by Google Gemini 2.5 & Web Audio API Splicing Engine. All Audio Processing is Secure and Client-Buffered.
+      </footer>
+    </div>
+  );
+}

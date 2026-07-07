@@ -1,0 +1,251 @@
+/**
+ * Helper to slice a chunk out of an AudioBuffer
+ */
+export function sliceAudioBuffer(
+  audioContext: AudioContext,
+  buffer: AudioBuffer,
+  startSec: number,
+  endSec: number,
+  applyFade = true
+): AudioBuffer {
+  const sampleRate = buffer.sampleRate;
+  const startSample = Math.floor(Math.max(0, startSec) * sampleRate);
+  const endSample = Math.floor(Math.min(buffer.duration, endSec) * sampleRate);
+  const durationSamples = Math.max(1, endSample - startSample);
+  const numberOfChannels = buffer.numberOfChannels;
+
+  const slicedBuffer = audioContext.createBuffer(
+    numberOfChannels,
+    durationSamples,
+    sampleRate
+  );
+
+  for (let channel = 0; channel < numberOfChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    const slicedData = slicedBuffer.getChannelData(channel);
+    slicedData.set(channelData.subarray(startSample, endSample));
+
+    if (applyFade) {
+      // Tiny fade-in & fade-out (e.g., 15ms) to prevent boundary clicks/pops
+      const fadeDurationSec = 0.015;
+      const fadeSamples = Math.floor(fadeDurationSec * sampleRate);
+      const limit = Math.min(fadeSamples, Math.floor(durationSamples / 2));
+      for (let i = 0; i < limit; i++) {
+        const fadeRatio = i / limit;
+        slicedData[i] *= fadeRatio;
+        slicedData[durationSamples - 1 - i] *= fadeRatio;
+      }
+    }
+  }
+
+  return slicedBuffer;
+}
+
+/**
+ * Helper to concatenate multiple AudioBuffers together with crossfading to eliminate pops, clicks, or skipping sound
+ */
+export function concatenateAudioBuffers(
+  audioContext: AudioContext,
+  buffers: AudioBuffer[]
+): AudioBuffer {
+  if (buffers.length === 0) {
+    // Return a short empty buffer if nothing to concatenate
+    return audioContext.createBuffer(1, 1, 44100);
+  }
+
+  const sampleRate = buffers[0].sampleRate;
+  const numberOfChannels = buffers[0].numberOfChannels;
+  
+  // 15ms crossfade is the perfect length to achieve a completely transparent edit point
+  const crossfadeDuration = 0.015; 
+  const maxFadeSamples = Math.floor(crossfadeDuration * sampleRate);
+
+  // Pre-calculate actual fade samples for each boundary
+  const fadeSamplesList: number[] = [];
+  let totalLength = buffers[0].length;
+
+  for (let i = 1; i < buffers.length; i++) {
+    const prev = buffers[i - 1];
+    const curr = buffers[i];
+    // Crossfade must be smaller than half the length of either buffer
+    const fade = Math.min(maxFadeSamples, Math.floor(prev.length / 2), Math.floor(curr.length / 2));
+    fadeSamplesList.push(fade);
+    totalLength += curr.length - fade;
+  }
+
+  const outBuffer = audioContext.createBuffer(
+    numberOfChannels,
+    totalLength,
+    sampleRate
+  );
+
+  for (let channel = 0; channel < numberOfChannels; channel++) {
+    const out = outBuffer.getChannelData(channel);
+    let outOffset = 0;
+
+    for (let i = 0; i < buffers.length; i++) {
+      const b = buffers[i].getChannelData(channel);
+      const leftFade = i === 0 ? 0 : fadeSamplesList[i - 1];
+      const rightFade = i === buffers.length - 1 ? 0 : fadeSamplesList[i];
+
+      // 1. Copy the left crossfade part (if any). It was already initiated by the previous buffer's end.
+      // We add our faded start to it.
+      if (i > 0) {
+        const fadeOffset = outOffset - leftFade;
+        for (let j = 0; j < leftFade; j++) {
+          const fraction = j / leftFade;
+          // Constant-power (equal power) trigonometric crossfade curves prevent volume dips at splice lines
+          const weightB = Math.sin(fraction * Math.PI / 2);
+          out[fadeOffset + j] += b[j] * weightB;
+        }
+      }
+
+      // 2. Copy the stable center of this buffer
+      const centerStart = leftFade;
+      const centerEnd = b.length - rightFade;
+      const centerLength = centerEnd - centerStart;
+      
+      for (let j = 0; j < centerLength; j++) {
+        out[outOffset + j] = b[centerStart + j];
+      }
+      outOffset += centerLength;
+
+      // 3. Initiate the right crossfade part (if any).
+      // We write our faded end to the output, ready to be summed by the next buffer's start.
+      if (rightFade > 0) {
+        for (let j = 0; j < rightFade; j++) {
+          const fraction = j / rightFade;
+          const weightA = Math.cos(fraction * Math.PI / 2);
+          out[outOffset + j] = b[centerEnd + j] * weightA;
+        }
+        outOffset += rightFade;
+      }
+    }
+  }
+
+  return outBuffer;
+}
+
+/**
+ * Standard WAV format encoder for AudioBuffers.
+ * Generates an uncompressed 16-bit PCM WAV file Blob.
+ */
+export function audioBufferToWav(buffer: AudioBuffer): Blob {
+  const numOfChan = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const format = 1; // Raw LPCM
+  const bitDepth = 16;
+
+  let result;
+  if (numOfChan === 2) {
+    result = interleave(buffer.getChannelData(0), buffer.getChannelData(1));
+  } else {
+    result = buffer.getChannelData(0);
+  }
+
+  const bufferArr = new ArrayBuffer(44 + result.length * 2);
+  const view = new DataView(bufferArr);
+
+  /* RIFF identifier */
+  writeString(view, 0, "RIFF");
+  /* file length */
+  view.setUint32(4, 36 + result.length * 2, true);
+  /* RIFF type */
+  writeString(view, 8, "WAVE");
+  /* format chunk identifier */
+  writeString(view, 12, "fmt ");
+  /* format chunk length */
+  view.setUint32(16, 16, true);
+  /* sample format (raw) */
+  view.setUint16(20, format, true);
+  /* channel count */
+  view.setUint16(22, numOfChan, true);
+  /* sample rate */
+  view.setUint32(24, sampleRate, true);
+  /* byte rate (sample rate * block align) */
+  view.setUint32(28, sampleRate * numOfChan * (bitDepth / 8), true);
+  /* block align (channel count * bytes per sample) */
+  view.setUint16(32, numOfChan * (bitDepth / 8), true);
+  /* bits per sample */
+  view.setUint16(34, bitDepth, true);
+  /* data chunk identifier */
+  writeString(view, 36, "data");
+  /* chunk length */
+  view.setUint32(40, result.length * 2, true);
+
+  // Write PCM audio samples (quantize to 16-bit integer)
+  floatTo16BitPCM(view, 44, result);
+
+  return new Blob([bufferArr], { type: "audio/wav" });
+}
+
+function interleave(inputL: Float32Array, inputR: Float32Array): Float32Array {
+  const length = inputL.length + inputR.length;
+  const result = new Float32Array(length);
+
+  let index = 0;
+  let inputIndex = 0;
+
+  while (index < length) {
+    result[index++] = inputL[inputIndex];
+    result[index++] = inputR[inputIndex];
+    inputIndex++;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(output: DataView, offset: number, input: Float32Array) {
+  for (let i = 0; i < input.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+}
+
+function writeString(view: DataView, offset: number, string: string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
+
+/**
+ * Finds the absolute quietest point (lowest average amplitude/RMS) in a given search window.
+ * This is used to slice audio files at natural pauses rather than cutting mid-sentence.
+ */
+export function findQuietestTime(
+  buffer: AudioBuffer,
+  targetTime: number,
+  windowRadiusSec = 8
+): number {
+  const sampleRate = buffer.sampleRate;
+  const channelData = buffer.getChannelData(0); // Use channel 0 for silence detection
+  
+  const startSec = Math.max(0, targetTime - windowRadiusSec);
+  const endSec = Math.min(buffer.duration, targetTime + windowRadiusSec);
+  
+  const startSample = Math.floor(startSec * sampleRate);
+  const endSample = Math.floor(endSec * sampleRate);
+  
+  // Analyze in steps of 50ms
+  const stepSec = 0.05;
+  const stepSamples = Math.floor(stepSec * sampleRate);
+  
+  let quietestTime = targetTime;
+  let lowestEnergy = Infinity;
+  
+  for (let s = startSample; s < endSample - stepSamples; s += stepSamples) {
+    let sum = 0;
+    const limit = Math.min(s + stepSamples, endSample);
+    for (let i = s; i < limit; i++) {
+      sum += channelData[i] * channelData[i];
+    }
+    const rms = Math.sqrt(sum / (limit - s));
+    
+    if (rms < lowestEnergy) {
+      lowestEnergy = rms;
+      quietestTime = s / sampleRate;
+    }
+  }
+  
+  return quietestTime;
+}
+

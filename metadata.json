@@ -1,5 +1,5 @@
 {
-  "name": "Spoken Word Audio Editor",
+  "name": "HandAISpoke Speech Repair",
   "description": "An AI-powered spoken word audio editor that automatically detects and removes spoken mistakes, pauses, and repeated takes.",
   "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

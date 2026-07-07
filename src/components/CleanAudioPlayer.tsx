@@ -6,9 +6,10 @@ interface CleanAudioPlayerProps {
   stitchedBuffer: AudioBuffer | null;
   onPlay?: () => void;
   isAnyOtherPlaying?: boolean;
+  onApplyToSource?: (buffer: AudioBuffer) => void;
 }
 
-export default function CleanAudioPlayer({ stitchedBuffer, onPlay, isAnyOtherPlaying }: CleanAudioPlayerProps) {
+export default function CleanAudioPlayer({ stitchedBuffer, onPlay, isAnyOtherPlaying, onApplyToSource }: CleanAudioPlayerProps) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -386,19 +387,37 @@ export default function CleanAudioPlayer({ stitchedBuffer, onPlay, isAnyOtherPla
           )}
         </div>
 
-        <button
-          id="download-clean-audio-btn"
-          disabled={!stitchedBuffer}
-          onClick={handleDownload}
-          className={`flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs font-semibold tracking-wide transition-all cursor-pointer ${
-            stitchedBuffer
-              ? "bg-slate-100 hover:bg-white text-slate-950 shadow active:scale-95"
-              : "bg-slate-800/80 text-slate-500 cursor-not-allowed"
-          }`}
-        >
-          <Download className="w-4 h-4" />
-          <span>Export Clean Master (.wav)</span>
-        </button>
+        <div className="flex items-center gap-3">
+          {onApplyToSource && (
+            <button
+              id="apply-repaired-to-source-btn"
+              disabled={!stitchedBuffer}
+              onClick={() => onApplyToSource(stitchedBuffer)}
+              className={`flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all cursor-pointer ${
+                stitchedBuffer
+                  ? "bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-md shadow-emerald-500/10 active:scale-95"
+                  : "bg-slate-800/80 text-slate-500 cursor-not-allowed"
+              }`}
+            >
+              <Sparkles className="w-4 h-4 fill-slate-950 text-slate-950" />
+              <span>Apply Repairs to Source</span>
+            </button>
+          )}
+
+          <button
+            id="download-clean-audio-btn"
+            disabled={!stitchedBuffer}
+            onClick={handleDownload}
+            className={`flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs font-semibold tracking-wide transition-all cursor-pointer ${
+              stitchedBuffer
+                ? "bg-slate-100 hover:bg-white text-slate-950 shadow active:scale-95"
+                : "bg-slate-800/80 text-slate-500 cursor-not-allowed"
+            }`}
+          >
+            <Download className="w-4 h-4" />
+            <span>Export Clean Master (.wav)</span>
+          </button>
+        </div>
       </div>
     </div>
   );

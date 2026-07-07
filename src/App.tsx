@@ -18,15 +18,22 @@ import {
   HelpCircle,
   Terminal,
   Activity,
+  X,
+  RefreshCw,
+  Globe,
 } from "lucide-react";
 import WaveformVisualizer from "./components/WaveformVisualizer";
 import SegmentList from "./components/SegmentList";
 import CleanAudioPlayer from "./components/CleanAudioPlayer";
 import AudioRecorder from "./components/AudioRecorder";
 import { AudioSegment, AppLog } from "./types";
-import { sliceAudioBuffer, concatenateAudioBuffers, findQuietestTime, audioBufferToWav, createFallbackAudioBuffer, convertRawPcmToWavBuffer } from "./utils/audioUtils";
+import { sliceAudioBuffer, concatenateAudioBuffers, findQuietestTime, audioBufferToWav, createFallbackAudioBuffer, convertRawPcmToWavBuffer, truncateSilencesFromBuffer } from "./utils/audioUtils";
 import DiagnosticsLogViewer from "./components/DiagnosticsLogViewer";
 import VoiceProfileStudio from "./components/VoiceProfileStudio";
+import VolumeNormalization from "./components/VolumeNormalization";
+import NoiseStudio from "./components/NoiseStudio";
+import DescriptiveEditing from "./components/DescriptiveEditing";
+import DistributionStudio from "./components/DistributionStudio";
 
 interface FileState {
   name: string;
@@ -42,8 +49,11 @@ export default function App() {
   const [stitchedBuffer, setStitchedBuffer] = useState<AudioBuffer | null>(null);
   const [segments, setSegments] = useState<AudioSegment[]>([]);
 
-  // Workspace Nav: "editor" vs "diagnostics" vs "tts"
-  const [workspaceTab, setWorkspaceTab] = useState<"editor" | "diagnostics" | "tts">("editor");
+  const [workspaceTab, setWorkspaceTab] = useState<"editor" | "diagnostics" | "tts" | "normalization" | "noise" | "descriptive" | "distribution">("editor");
+  const [showWorkspaceGuide, setShowWorkspaceGuide] = useState(true);
+  const [silenceThreshold, setSilenceThreshold] = useState(-40);
+  const [maxSilenceDuration, setMaxSilenceDuration] = useState(0.3);
+  const [isTruncatingSilence, setIsTruncatingSilence] = useState(false);
 
   // Logging and Telemetry States
   const [logs, setLogs] = useState<AppLog[]>([]);
@@ -235,8 +245,11 @@ export default function App() {
     try {
       const response = await fetch("/api/logs");
       if (response.ok) {
-        const data = await response.json();
-        setServerLogs(data);
+        const contentType = response.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+          const data = await response.json();
+          setServerLogs(data);
+        }
       }
     } catch (e) {
       console.error("Failed to fetch server logs", e);
@@ -506,6 +519,55 @@ export default function App() {
       }
     };
     reader.readAsText(file);
+  };
+
+  const convertBlobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onloadend = () => {
+        resolve((r.result as string).split(",")[1]);
+      };
+      r.onerror = reject;
+      r.readAsDataURL(blob);
+    });
+  };
+
+  const handleTruncateSilence = async () => {
+    if (!audioBuffer) return;
+    setIsTruncatingSilence(true);
+    addLog("info", "action", `Truncating silence below ${silenceThreshold} dBFS down to max ${maxSilenceDuration}s`);
+    
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const tempCtx = new AudioCtx();
+      
+      const res = truncateSilencesFromBuffer(tempCtx, audioBuffer, silenceThreshold, maxSilenceDuration);
+      
+      // Convert to WAV/Base64 to update originalFile
+      const wavBlob = audioBufferToWav(res.buffer);
+      const newBase64 = await convertBlobToBase64(wavBlob);
+      
+      setAudioBuffer(res.buffer);
+      if (originalFile) {
+        setOriginalFile({
+          ...originalFile,
+          base64: newBase64
+        });
+      }
+      
+      // Since timeline time shifted, we must clear segments and stitched state
+      setSegments([]);
+      setStitchedBuffer(null);
+      
+      addLog("success", "action", `Silence truncation successful! Shortened ${res.truncatedCount} silences. Duration reduced from ${res.originalDuration.toFixed(2)}s to ${res.newDuration.toFixed(2)}s`);
+      
+      tempCtx.close();
+    } catch (err: any) {
+      addLog("error", "action", `Silence truncation failed: ${err.message}`);
+      console.error(err);
+    } finally {
+      setIsTruncatingSilence(false);
+    }
   };
 
   const triggerAnalyze = async (rangeStart?: number, rangeEnd?: number) => {
@@ -1268,6 +1330,28 @@ export default function App() {
     setSelectionEnd(null);
   };
 
+  const handleApplyRepairsToSource = (repairedBuffer: AudioBuffer) => {
+    if (!originalFile) return;
+    try {
+      const wavBlob = audioBufferToWav(repairedBuffer);
+      const reader = new FileReader();
+      reader.readAsDataURL(wavBlob);
+      reader.onloadend = () => {
+        const base64data = reader.result as string;
+        setAudioBuffer(repairedBuffer);
+        setOriginalFile({
+          ...originalFile,
+          base64: base64data
+        });
+        setStitchedBuffer(null);
+        setSegments([]);
+        addLog("success", "action", "Applied speech repairs: Repaired track replaced the original source audio.");
+      };
+    } catch (err: any) {
+      addLog("error", "browser", `Failed to apply repairs to source: ${err.message}`);
+    }
+  };
+
   // Segment adjustment handlers
   const handleUpdateSegment = (updated: AudioSegment) => {
     setSegments((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
@@ -1292,7 +1376,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-base font-bold text-slate-100 tracking-tight flex items-center gap-2">
-                Spoken Word Audio Editor
+                HandAISpoke Speech Repair
                 <span className="text-[10px] font-mono font-medium text-emerald-400 bg-emerald-950/60 border border-emerald-900/40 px-2 py-0.5 rounded-full uppercase tracking-wider">
                   AI-Powered
                 </span>
@@ -1325,7 +1409,7 @@ export default function App() {
               id="workspace-tab-editor"
               onClick={() => {
                 setWorkspaceTab("editor");
-                addLog("info", "action", "Navigated to main Editor Studio view");
+                addLog("info", "action", "Navigated to Speech Repair view");
               }}
               className={`flex items-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
                 workspaceTab === "editor"
@@ -1334,7 +1418,22 @@ export default function App() {
               }`}
             >
               <Activity className="w-4 h-4" />
-              <span>Editor Studio</span>
+              <span>Speech Repair</span>
+            </button>
+            <button
+              id="workspace-tab-normalization"
+              onClick={() => {
+                setWorkspaceTab("normalization");
+                addLog("info", "action", "Opened Volume Normalization & Hard Limiter Studio");
+              }}
+              className={`flex items-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                workspaceTab === "normalization"
+                  ? "bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/10 font-bold"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Volume2 className="w-4 h-4" />
+              <span>Volume Normalization</span>
             </button>
             <button
               id="workspace-tab-tts"
@@ -1350,6 +1449,51 @@ export default function App() {
             >
               <Sparkles className="w-4 h-4" />
               <span>Voice Profile & TTS</span>
+            </button>
+            <button
+              id="workspace-tab-noise"
+              onClick={() => {
+                setWorkspaceTab("noise");
+                addLog("info", "action", "Opened Noise Management Studio");
+              }}
+              className={`flex items-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                workspaceTab === "noise"
+                  ? "bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/10 font-bold"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Volume2 className="w-4 h-4" />
+              <span>Noise Management</span>
+            </button>
+            <button
+              id="workspace-tab-descriptive"
+              onClick={() => {
+                setWorkspaceTab("descriptive");
+                addLog("info", "action", "Opened Descriptive Editing Studio");
+              }}
+              className={`flex items-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                workspaceTab === "descriptive"
+                  ? "bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/10 font-bold"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Sparkles className="w-4 h-4" />
+              <span>Descriptive Editing</span>
+            </button>
+            <button
+              id="workspace-tab-distribution"
+              onClick={() => {
+                setWorkspaceTab("distribution");
+                addLog("info", "action", "Opened Distribution Studio");
+              }}
+              className={`flex items-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                workspaceTab === "distribution"
+                  ? "bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/10 font-bold"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Globe className="w-4 h-4" />
+              <span>Distribution</span>
             </button>
             <button
               id="workspace-tab-diagnostics"
@@ -1378,7 +1522,8 @@ export default function App() {
         </div>
 
         {/* Dynamic Content based on Active Workspace Tab */}
-        {workspaceTab === "diagnostics" ? (
+        {/* Diagnostics & Logs Tab Content */}
+        <div className={workspaceTab === "diagnostics" ? "contents" : "hidden"} id="workspace-content-diagnostics">
           <DiagnosticsLogViewer
             logs={logs}
             serverLogs={serverLogs}
@@ -1387,7 +1532,10 @@ export default function App() {
             isPolling={isPollingLogs}
             setIsPolling={setIsPollingLogs}
           />
-        ) : workspaceTab === "tts" ? (
+        </div>
+
+        {/* Voice Profile & TTS Tab Content */}
+        <div className={workspaceTab === "tts" ? "contents" : "hidden"} id="workspace-content-tts">
           <VoiceProfileStudio
             originalFile={originalFile ? {
               name: originalFile.name,
@@ -1400,8 +1548,108 @@ export default function App() {
             onAddSegment={handleAddSegment}
             onUpdateSegment={handleUpdateSegment}
             addLog={addLog}
+            onSetMasterTimeline={(newBuffer, newSegments, filename, base64) => {
+              setAudioBuffer(newBuffer);
+              setSegments(newSegments);
+              setOriginalFile({
+                name: filename,
+                type: "audio/wav",
+                file: new File([], filename, { type: "audio/wav" }),
+                base64: base64
+              });
+              setStitchedBuffer(null);
+              setWorkspaceTab("editor");
+              addLog("success", "action", `Stitched multi-speaker script timeline loaded successfully as the main source for editing!`);
+            }}
           />
-        ) : !originalFile ? (
+        </div>
+
+        {/* Volume Normalization Tab Content */}
+        <div className={workspaceTab === "normalization" ? "contents" : "hidden"} id="workspace-content-normalization">
+          <VolumeNormalization
+            audioBuffer={audioBuffer}
+            originalFile={originalFile ? {
+              name: originalFile.name,
+              type: originalFile.type,
+              file: originalFile.file,
+              base64: originalFile.base64
+            } : null}
+            onApplyNormalized={(newBuffer, newBase64) => {
+              setAudioBuffer(newBuffer);
+              if (originalFile) {
+                setOriginalFile({
+                  ...originalFile,
+                  base64: newBase64
+                });
+              }
+              setStitchedBuffer(null);
+            }}
+            addLog={addLog}
+          />
+        </div>
+
+        {/* Noise Management Tab Content */}
+        <div className={workspaceTab === "noise" ? "contents" : "hidden"} id="workspace-content-noise">
+          <NoiseStudio
+            audioBuffer={audioBuffer}
+            originalFile={originalFile ? {
+              name: originalFile.name,
+              type: originalFile.type,
+              base64: originalFile.base64 || ""
+            } : null}
+            onApplyNoiseProcessed={(newBuffer, newBase64) => {
+              setAudioBuffer(newBuffer);
+              if (originalFile) {
+                setOriginalFile({
+                  ...originalFile,
+                  base64: newBase64
+                });
+              }
+              setStitchedBuffer(null);
+            }}
+            addLog={addLog}
+          />
+        </div>
+
+        {/* Descriptive Editing Tab Content */}
+        <div className={workspaceTab === "descriptive" ? "contents" : "hidden"} id="workspace-content-descriptive">
+          <DescriptiveEditing
+            audioBuffer={audioBuffer}
+            originalFile={originalFile ? {
+              name: originalFile.name,
+              type: originalFile.type,
+              base64: originalFile.base64 || ""
+            } : null}
+            onApplyDescriptive={(newBuffer, newBase64) => {
+              setAudioBuffer(newBuffer);
+              if (originalFile) {
+                setOriginalFile({
+                  ...originalFile,
+                  base64: newBase64
+                });
+              }
+              setStitchedBuffer(null);
+            }}
+            addLog={addLog}
+          />
+        </div>
+
+        {/* Distribution Tab Content */}
+        <div className={workspaceTab === "distribution" ? "contents" : "hidden"} id="workspace-content-distribution">
+          <DistributionStudio
+            audioBuffer={audioBuffer}
+            originalFile={originalFile ? {
+              name: originalFile.name,
+              type: originalFile.type,
+              base64: originalFile.base64 || ""
+            } : null}
+            addLog={addLog}
+          />
+        </div>
+
+        {/* Speech Repair Tab Content */}
+        <div className={workspaceTab === "editor" ? "contents" : "hidden"} id="workspace-content-editor">
+          {!originalFile ? (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 items-stretch">
             {/* Left side upload */}
             <div className="lg:col-span-7 flex flex-col justify-between p-8 bg-slate-900/40 rounded-2xl border border-slate-800/80 backdrop-blur-md">
@@ -1883,31 +2131,128 @@ export default function App() {
                   clearAudition();
                 }}
                 isAnyOtherPlaying={isPlayingOriginal || currentlyAuditioning !== null}
+                onApplyToSource={handleApplyRepairsToSource}
               />
 
-              <div className="p-5 bg-slate-900/40 rounded-2xl border border-slate-800/80 backdrop-blur-sm flex flex-col gap-4 leading-relaxed text-xs text-slate-400">
-                <h4 className="font-semibold text-slate-200 flex items-center gap-1.5 uppercase tracking-wide text-[10px] border-b border-slate-800 pb-2">
-                  <BookOpen className="w-4 h-4 text-emerald-400" />
-                  Workspace Guide & Control Features
-                </h4>
-                <ul className="flex flex-col gap-2.5 list-disc list-inside ml-1">
-                  <li>
-                    <strong>Toggle Slices</strong>: Check/uncheck any segment in the list. The final audio compiles and adjusts **reactively inside your browser** within milliseconds.
-                  </li>
-                  <li>
-                    <strong>Fine-tuning Boundaries</strong>: Click the pencil icon on any segment to edit its start and end timing precisely, perfect for snug verbal transitions.
-                  </li>
-                  <li>
-                    <strong>Waveform Dragging</strong>: Click on the original timeline waveform to instantly jump your audition cursor.
-                  </li>
-                  <li>
-                    <strong>Lossless WAV Export</strong>: Clicking "Export Clean Master" generates and packages your final take directly on your machine with no extra server wait time.
-                  </li>
-                </ul>
+              {showWorkspaceGuide && (
+                <div className="p-5 bg-slate-900/40 rounded-2xl border border-slate-800/80 backdrop-blur-sm flex flex-col gap-4 leading-relaxed text-xs text-slate-400 relative">
+                  <button 
+                    onClick={() => setShowWorkspaceGuide(false)}
+                    className="absolute top-4 right-4 text-slate-500 hover:text-slate-300 transition-colors p-1 cursor-pointer"
+                    title="Dismiss Guide"
+                    id="btn-dismiss-workspace-guide"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                  <h4 className="font-semibold text-slate-200 flex items-center gap-1.5 uppercase tracking-wide text-[10px] border-b border-slate-800 pb-2 pr-6">
+                    <BookOpen className="w-4 h-4 text-emerald-400" />
+                    Workspace Guide & Control Features
+                  </h4>
+                  <ul className="flex flex-col gap-2.5 list-disc list-inside ml-1">
+                    <li>
+                      <strong>Toggle Slices</strong>: Check/uncheck any segment in the list. The final audio compiles and adjusts **reactively inside your browser** within milliseconds.
+                    </li>
+                    <li>
+                      <strong>Fine-tuning Boundaries</strong>: Click the pencil icon on any segment to edit its start and end timing precisely, perfect for snug verbal transitions.
+                    </li>
+                    <li>
+                      <strong>Waveform Dragging</strong>: Click on the original timeline waveform to instantly jump your audition cursor.
+                    </li>
+                    <li>
+                      <strong>Lossless WAV Export</strong>: Clicking "Export Clean Master" generates and packages your final take directly on your machine with no extra server wait time.
+                    </li>
+                  </ul>
+                </div>
+              )}
+
+              {/* Truncate Silence Card */}
+              <div className="p-5 bg-slate-900/40 rounded-2xl border border-slate-800/80 backdrop-blur-sm flex flex-col gap-4">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <h4 className="font-semibold text-slate-200 flex items-center gap-1.5 uppercase tracking-wide text-[10px]">
+                    <Volume2 className="w-4 h-4 text-emerald-400" />
+                    Truncate Silence (Smart Trim)
+                  </h4>
+                  <span className="text-[10px] font-mono text-slate-500 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
+                    DSP Utility
+                  </span>
+                </div>
+                
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Automatically trim down excessively long pauses and silent takes to a snug pacing in a single click.
+                </p>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Threshold Slider */}
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-slate-400 font-medium">Silence Threshold</span>
+                      <span className="font-mono text-emerald-400 font-bold">{silenceThreshold} dBFS</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-60"
+                      max="-20"
+                      step="1"
+                      value={silenceThreshold}
+                      onChange={(e) => setSilenceThreshold(parseInt(e.target.value))}
+                      className="w-full accent-emerald-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                    />
+                    <span className="text-[9px] text-slate-500 font-mono">Standard is -40 dBFS</span>
+                  </div>
+
+                  {/* Max Silence Duration Slider */}
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-slate-400 font-medium">Max Silence Duration</span>
+                      <span className="font-mono text-emerald-400 font-bold">{maxSilenceDuration.toFixed(2)}s</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.1"
+                      max="1.5"
+                      step="0.05"
+                      value={maxSilenceDuration}
+                      onChange={(e) => setMaxSilenceDuration(parseFloat(e.target.value))}
+                      className="w-full accent-emerald-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                    />
+                    <span className="text-[9px] text-slate-500 font-mono">Trim pauses exceeding this length</span>
+                  </div>
+                </div>
+
+                {segments.length > 0 && (
+                  <div className="p-2.5 bg-amber-950/20 border border-amber-900/30 rounded-xl text-[11px] text-amber-400 font-sans flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>
+                      Applying Truncate Silence shifts the absolute timeline, which will clear any active vocal slice timeline markers.
+                    </span>
+                  </div>
+                )}
+
+                <div className="flex justify-end mt-2">
+                  <button
+                    onClick={handleTruncateSilence}
+                    disabled={isTruncatingSilence || !audioBuffer}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-900 disabled:bg-slate-950 disabled:text-slate-600 text-slate-200 hover:text-white font-semibold rounded-xl text-xs tracking-wide border border-slate-700 disabled:border-slate-800 transition-all flex items-center gap-1.5 cursor-pointer"
+                    id="btn-truncate-silence"
+                  >
+                    {isTruncatingSilence ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                        <span>Trimming Silence...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Apply Truncate Silence</span>
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
         )}
+        </div>
       </main>
 
       {/* AI Voice Patch Studio Modal Overlay */}

@@ -1440,7 +1440,7 @@ export default function VoiceProfileStudio({
                     )}
                     {voicePreset === "cloned" && (profileSource === "direct" || selectedVoiceSegmentId) && (
                       <span className="text-[10px] text-emerald-400 font-mono">
-                        ✨ Perfect! Gemini will replicate the voice of the cloned training source.
+                        ✨ Perfect! HandAISpoke will replicate the voice of the cloned training source.
                       </span>
                     )}
                   </div>

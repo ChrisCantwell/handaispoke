@@ -48,12 +48,32 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // Lazy init/helper for Gemini AI SDK
 let aiClient: GoogleGenAI | null = null;
+let currentLoadedKey: string | null = null;
 function getAI(): GoogleGenAI {
-  if (!aiClient) {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key || key === "MY_GEMINI_API_KEY") {
-      throw new Error("GEMINI_API_KEY environment variable is not configured. Please add your Gemini API Key in the Secrets panel.");
+  let key = "";
+  try {
+    const configPath = path.join(process.cwd(), "tts-config-store.json");
+    if (fs.existsSync(configPath)) {
+      const fileData = fs.readFileSync(configPath, "utf-8");
+      const parsed = JSON.parse(fileData);
+      if (parsed.geminiApiKey && parsed.geminiApiKey.trim() !== "") {
+        key = parsed.geminiApiKey.trim();
+      }
     }
+  } catch (err: any) {
+    // Ignore and fallback
+  }
+
+  if (!key) {
+    key = (process.env.GEMINI_API_KEY || "").trim();
+  }
+
+  if (!key || key === "MY_GEMINI_API_KEY") {
+    throw new Error("GEMINI_API_KEY environment variable is not configured. Please add your Gemini API Key in the System Settings tab.");
+  }
+
+  if (!aiClient || currentLoadedKey !== key) {
+    currentLoadedKey = key;
     aiClient = new GoogleGenAI({
       apiKey: key,
       httpOptions: {
@@ -96,7 +116,7 @@ async function callGeminiWithRetry<T>(fn: () => Promise<T>, retries = 3, delayMs
   }
 }
 
-// Helper to try a preferred model first, with automatic fallback to other models if we hit a 429 quota or resource exhausted limit
+// Helper to try a preferred model first, with automatic fallback to other models if we hit a 429 quota, resource limit, or high-demand/temporary error
 async function generateContentWithFallback(ai: GoogleGenAI, baseOptions: any, fallbackModels: string[] = ["gemini-3.1-flash-lite", "gemini-flash-latest"]): Promise<any> {
   const models = [baseOptions.model || "gemini-3.5-flash", ...fallbackModels];
   let lastError: any = null;
@@ -117,11 +137,19 @@ async function generateContentWithFallback(ai: GoogleGenAI, baseOptions: any, fa
                            errorMsg.toLowerCase().includes("resource_exhausted") ||
                            errorMsg.toLowerCase().includes("exhausted");
       
-      if (isQuotaLimit) {
-        console.warn(`Model ${model} returned a quota limit error. Retrying with next available fallback model...`);
+      const isTransientOrDemand = error.status === 503 ||
+                                  errorMsg.includes("503") ||
+                                  errorMsg.toLowerCase().includes("high demand") ||
+                                  errorMsg.toLowerCase().includes("overloaded") ||
+                                  errorMsg.toLowerCase().includes("unavailable") ||
+                                  errorMsg.toLowerCase().includes("temporary") ||
+                                  errorMsg.toLowerCase().includes("spikes in demand");
+
+      if (isQuotaLimit || isTransientOrDemand) {
+        console.warn(`Model ${model} returned a limit/demand error (${errorMsg}). Retrying with next available fallback model...`);
         continue;
       }
-      // If it's a different kind of error, throw it immediately rather than masking it
+      // If it's a different kind of error (e.g. invalid parameters), throw it immediately rather than masking it
       throw error;
     }
   }
@@ -210,12 +238,188 @@ app.post("/api/analyze-audio", async (req, res) => {
       return res.status(400).json({ error: "Missing 'mimeType' (e.g., audio/mp3, audio/wav, audio/webm)." });
     }
 
+    const config = getTTSConfig();
+    const sttEngine = config.sttEngine || "handaispoke";
     const ai = getAI();
 
     const audioSizeKb = Math.round(audio.length / 1024);
     const chunkInfo = chunkStart !== undefined ? `${chunkStart.toFixed(1)}s - ${chunkEnd.toFixed(1)}s` : "Full file";
-    logToServer("info", "api", `Audio Analysis Started. MimeType: ${mimeType}, Size: ${audioSizeKb} KB, Script provided: ${!!script}, Interval: ${chunkInfo}`);
+    logToServer("info", "api", `Audio Analysis Started. Engine: ${sttEngine}, MimeType: ${mimeType}, Size: ${audioSizeKb} KB, Script provided: ${!!script}, Interval: ${chunkInfo}`);
 
+    if (sttEngine === "handaispoke") {
+      const bridgeUrl = config.handaiSpokeUrl || "https://handaispokeapi.thehandaiman.com";
+      const bridgeToken = config.handaiSpokeToken || "";
+
+      if (!bridgeToken) {
+        logToServer("error", "api", "HandAISpoke transcription failed: Bridge Token not configured.");
+        return res.status(400).json({ error: "HandAISpoke Bridge Token is not configured. Please set your token in the Settings Studio." });
+      }
+
+      logToServer("info", "api", `Sending chunk to local HandAISpoke bridge for speech-to-text at: ${bridgeUrl}/v1/audio/transcriptions`);
+
+      const audioBuffer = Buffer.from(audio, "base64");
+      const formData = new FormData();
+      const audioBlob = new Blob([audioBuffer], { type: mimeType });
+      formData.append("file", audioBlob, "chunk.wav");
+      formData.append("model", "whisperx");
+      formData.append("response_format", "verbose_json");
+      formData.append("timestamp_granularities[]", "segment");
+
+      const transcriptionResponse = await fetch(`${bridgeUrl}/v1/audio/transcriptions`, {
+        method: "POST",
+        headers: {
+          "X-HandAISpoke-Bridge-Token": bridgeToken
+        },
+        body: formData
+      });
+
+      if (!transcriptionResponse.ok) {
+        const errText = await transcriptionResponse.text();
+        throw new Error(`Local HandAISpoke API returned status ${transcriptionResponse.status}: ${errText.slice(0, 300)}`);
+      }
+
+      const transcriptionResult = await transcriptionResponse.json() as any;
+      if (transcriptionResult.ok === false) {
+        throw new Error(transcriptionResult.error || "Transcription failed from local speech engine.");
+      }
+
+      const rawSegments = transcriptionResult.segments || [];
+      logToServer("success", "api", `Local Faster-Whisper/WhisperX completed. Transcribed ${rawSegments.length} segments.`);
+
+      // Now align and repair using Gemini text model
+      logToServer("info", "api", "Calling Gemini (text-only mode) to suggest edits and repair cuts based on WhisperX timestamps...");
+
+      let alignmentInstruction = "";
+      if (script && typeof script === "string" && script.trim()) {
+        alignmentInstruction = "You are an expert spoken word, voiceover, and podcast editing system.\n" +
+          "The user has provided a vocal audio recording and a REFERENCE SCRIPT that the speaker is reading.\n" +
+          "Below is a list of transcribed WhisperX segments with start/end timestamps. The speaker made several mistakes, stutters, or repeated lines, but they eventually read the entire script successfully.\n\n" +
+          "Your job is to align the transcribed WhisperX segments to the reference script with absolute completeness and precision.\n\n" +
+          "CRITICAL INSTRUCTIONS:\n" +
+          "1. COMPLETE SCRIPT COVERAGE: You must produce keep segments covering EVERY SINGLE SENTENCE and CLAUSE in the provided Reference Script. Under no circumstances should you skip, truncate, or omit any sentence of the script.\n" +
+          "2. DO NOT SWEEP MESSY SECTIONS AWAY: Identify the stutters, repetitions, and bad takes, discard ONLY those short sub-segments, and KEEP the successful takes for each sentence.\n" +
+          "3. TIMESTAMPS: The start and end times for each keep segment must match the actual timestamps of the successful speech from the WhisperX segments list. Values must be relative to the start of this chunk.\n" +
+          "4. TRANSCRIPTS: The transcript for each kept segment should be the clean, correct words from the script that are spoken in that segment.\n\n" +
+          "REFERENCE SCRIPT:\n" +
+          `"${script.trim()}"\n\n`;
+
+        if (typeof chunkStart === "number" && typeof chunkEnd === "number") {
+          alignmentInstruction += `\nCHUNK CONTEXT:\n` +
+            `- You are analyzing a pre-sliced CHUNK of the audio from global timestamp ${chunkStart.toFixed(2)}s to ${chunkEnd.toFixed(2)}s.\n` +
+            `- Timestamps must be relative to the start of this chunk (0.0s is the beginning of the chunk, max duration is ${(chunkEnd - chunkStart).toFixed(2)}s).\n\n`;
+        }
+      } else {
+        alignmentInstruction = "You are an expert spoken word, interview, and podcast production assistant.\n" +
+          "Below is a list of transcribed WhisperX segments with start/end timestamps. The speaker frequently makes mistakes and repeats lines (going back to repeat the correct version of a sentence or phrase).\n" +
+          "Your goal is to perform intelligent 'edit-on-word' detection. Identify and filter out all repeated lines, stuttered starts, and speech errors, KEEPING only the final, complete, correct version of each take.\n" +
+          "Preserve all interviewer questions or comments in full.\n" +
+          "The start and end times for each keep segment must align with the WhisperX segments timestamps.\n\n";
+      }
+
+      alignmentInstruction += `WHISPERX TRANSCRIBED SEGMENTS:\n${JSON.stringify(rawSegments, null, 2)}\n\n` +
+        "Output a structured JSON object containing a 'keeps' array where each item has 'start' (number), 'end' (number), and 'transcript' (string).\n" +
+        "Standard keeps schema: { keeps: [ { start: number, end: number, transcript: string } ] }";
+
+      const geminiResponse = await generateContentWithFallback(ai, {
+        model: "gemini-3.5-flash",
+        contents: [alignmentInstruction],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              keeps: {
+                type: "ARRAY",
+                description: "Ordered list of time ranges of the final successful takes that should be kept, with duplicates, mistakes, and bad takes removed.",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    start: { type: "NUMBER", description: "Start time of this clean take in seconds (can be decimal)" },
+                    end: { type: "NUMBER", description: "End time of this clean take in seconds (can be decimal)" },
+                    transcript: { type: "STRING", description: "Accurate transcript of the words spoken in this segment" }
+                  },
+                  required: ["start", "end", "transcript"]
+                }
+              }
+            },
+            required: ["keeps"]
+          }
+        }
+      });
+
+      const text = geminiResponse.text;
+      if (!text) {
+        throw new Error("No alignment/cuts output text received from Gemini API.");
+      }
+
+      const parsed = JSON.parse(text);
+      
+      // Calculate discards from rawSegments and keeps
+      const keeps = parsed.keeps || [];
+      const sortedKeeps = [...keeps].sort((a: any, b: any) => parseFloat(a.start) - parseFloat(b.start));
+      const discards: any[] = [];
+      let currentPos = 0;
+
+      sortedKeeps.forEach((kSeg: any) => {
+        const kStart = parseFloat(kSeg.start);
+        const kEnd = parseFloat(kSeg.end);
+        if (kStart > currentPos + 0.1) {
+          const gapStart = currentPos;
+          const gapEnd = kStart;
+
+          // Find overlapping raw WhisperX segments
+          const overlappingText = rawSegments
+            .filter((seg: any) => {
+              const sStart = parseFloat(seg.start);
+              const sEnd = parseFloat(seg.end);
+              return sEnd > gapStart + 0.05 && sStart < gapEnd - 0.05;
+            })
+            .map((seg: any) => (seg.text || seg.transcript || "").trim())
+            .filter((t: string) => t.length > 0)
+            .join(" ");
+
+          discards.push({
+            start: gapStart,
+            end: gapEnd,
+            transcript: overlappingText.trim() || "[Silent pause or preparation]"
+          });
+        }
+        currentPos = kEnd;
+      });
+
+      // Trailing discard if any
+      const maxDuration = rawSegments.length > 0 
+        ? Math.max(...rawSegments.map((seg: any) => parseFloat(seg.end))) 
+        : currentPos;
+
+      if (maxDuration > currentPos + 0.1) {
+        const gapStart = currentPos;
+        const gapEnd = maxDuration;
+        const overlappingText = rawSegments
+          .filter((seg: any) => {
+            const sStart = parseFloat(seg.start);
+            const sEnd = parseFloat(seg.end);
+            return sEnd > gapStart + 0.05 && sStart < gapEnd - 0.05;
+          })
+          .map((seg: any) => (seg.text || seg.transcript || "").trim())
+          .filter((t: string) => t.length > 0)
+          .join(" ");
+
+        discards.push({
+          start: gapStart,
+          end: gapEnd,
+          transcript: overlappingText.trim() || "[Tail silence or room tone]"
+        });
+      }
+
+      parsed.discards = discards;
+
+      const count = parsed.keeps?.length || 0;
+      logToServer("success", "api", `Audio Analysis Successful (Local STT + Gemini Alignment). Found ${count} keep segments and ${discards.length} discard segments.`);
+      return res.json(parsed);
+    }
+
+    // Otherwise, fallback to the original pure Gemini AI approach
     let userInstruction = "";
     if (script && typeof script === "string" && script.trim()) {
       userInstruction = "You are an expert spoken word, voiceover, and podcast editing system.\n" +
@@ -228,7 +432,8 @@ app.post("/api/analyze-audio", async (req, res) => {
         "3. NEVER DISCARD PROGRESS: Every single sentence in the script has a final successful spoken version in the audio. You must find and keep that final successful version of every sentence. Do not delete long chunks of continuous speech unless they are direct repetitions of lines spoken later.\n" +
         "4. GRANULAR SEGMENTATION: Do not group multiple long paragraphs or sentences into a single massive segment. Break them down into sentence-level or phrase-level segments (typically 3 to 15 seconds long). This ensures alignment precision and prevents audio skipping.\n" +
         "5. TRANSCRIPTS: The transcript for each kept segment should be the clean, correct words from the script that are spoken in that segment.\n" +
-        "6. CHRONOLOGICAL TIMELINE: Return the segments in strict chronological order. Timestamps (in seconds) must be highly accurate and not overlap.\n\n" +
+        "6. DISCARDS: For any sections you decide to cut/discard (bad takes, repetitions, stutters), transcribe the actual words spoken in that bad take and include them in the 'discards' array.\n" +
+        "7. CHRONOLOGICAL TIMELINE: Return the segments in strict chronological order. Timestamps (in seconds) must be highly accurate and not overlap.\n\n" +
         "REFERENCE SCRIPT:\n" +
         `"${script.trim()}"\n\n`;
 
@@ -251,7 +456,7 @@ app.post("/api/analyze-audio", async (req, res) => {
         "2. For the main speaker's lines or answers: identify and filter out all repeated lines, stuttered starts, and speech errors, KEEPING only the final, complete, correct version of each take. " +
         "3. Keep the intervals of silence or natural pauses between distinct questions or thoughts reasonable, but clean out excessive dead air. " +
         "For each segment to keep, identify its exact start time, end time, and a short transcript of what is spoken. " +
-        "Return the keep segments in order as a structured JSON object.";
+        "For each segment to cut/discard (the mistakes, repeated lines, or stuttered takes), identify its start time, end time, and a transcript of the actual spoken words in that bad take. Return both keeps and discards lists in the JSON.";
     }
 
     const response = await generateContentWithFallback(ai, {
@@ -282,9 +487,22 @@ app.post("/api/analyze-audio", async (req, res) => {
                 },
                 required: ["start", "end", "transcript"]
               }
+            },
+            discards: {
+              type: "ARRAY",
+              description: "Ordered list of time ranges and exact transcripts of the bad takes, mistakes, repeated lines, stutters, or silences that should be cut out and discarded.",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  start: { type: "NUMBER", description: "Start time of this cut/discarded segment in seconds (can be decimal)" },
+                  end: { type: "NUMBER", description: "End time of this cut/discarded segment in seconds (can be decimal)" },
+                  transcript: { type: "STRING", description: "Exact transcription of the words spoken in this bad take/mistake that are being discarded, or a description of the silence/pause" }
+                },
+                required: ["start", "end", "transcript"]
+              }
             }
           },
-          required: ["keeps"]
+          required: ["keeps", "discards"]
         }
       }
     });
@@ -296,7 +514,8 @@ app.post("/api/analyze-audio", async (req, res) => {
 
     const parsed = JSON.parse(text);
     const count = parsed.keeps?.length || 0;
-    logToServer("success", "api", `Audio Analysis Successful. Found ${count} non-destructive keep segments to stitch.`);
+    const discardCount = parsed.discards?.length || 0;
+    logToServer("success", "api", `Audio Analysis Successful. Found ${count} non-destructive keep segments and ${discardCount} discard segments.`);
     return res.json(parsed);
 
   } catch (error: any) {
@@ -306,6 +525,69 @@ app.post("/api/analyze-audio", async (req, res) => {
     });
   }
 });
+
+// Secure server-side storage of TTS config
+interface TTSConfig {
+  localTtsUrl: string;
+  localTtsToken: string;
+  geminiApiKey?: string;
+  sttEngine?: "gemini" | "handaispoke";
+  handaiSpokeUrl?: string;
+  handaiSpokeToken?: string;
+}
+
+const TTS_CONFIG_PATH = path.join(process.cwd(), "tts-config-store.json");
+
+function getTTSConfig(): TTSConfig {
+  // First, check server-side store
+  try {
+    if (fs.existsSync(TTS_CONFIG_PATH)) {
+      const fileData = fs.readFileSync(TTS_CONFIG_PATH, "utf-8");
+      const parsed = JSON.parse(fileData);
+      return {
+        localTtsUrl: parsed.localTtsUrl || "",
+        localTtsToken: parsed.localTtsToken || "",
+        geminiApiKey: parsed.geminiApiKey || "",
+        sttEngine: parsed.sttEngine || "handaispoke",
+        handaiSpokeUrl: parsed.handaiSpokeUrl || "https://handaispokeapi.thehandaiman.com",
+        handaiSpokeToken: parsed.handaiSpokeToken || ""
+      };
+    }
+  } catch (err: any) {
+    logToServer("warn", "server", `Could not read TTS config file: ${err.message}`);
+  }
+
+  // Fallback to process env
+  if (process.env.LOCAL_TTS_URL) {
+    return {
+      localTtsUrl: process.env.LOCAL_TTS_URL.trim(),
+      localTtsToken: (process.env.LOCAL_TTS_TOKEN || "").trim(),
+      geminiApiKey: (process.env.GEMINI_API_KEY || "").trim(),
+      sttEngine: (process.env.STT_ENGINE as any) || "handaispoke",
+      handaiSpokeUrl: process.env.HANDAISPOKE_URL || "https://handaispokeapi.thehandaiman.com",
+      handaiSpokeToken: process.env.HANDAISPOKE_TOKEN || ""
+    };
+  }
+
+  return { 
+    localTtsUrl: "", 
+    localTtsToken: "", 
+    geminiApiKey: "",
+    sttEngine: "handaispoke",
+    handaiSpokeUrl: "https://handaispokeapi.thehandaiman.com",
+    handaiSpokeToken: ""
+  };
+}
+
+function saveTTSConfig(config: TTSConfig) {
+  try {
+    fs.writeFileSync(TTS_CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+    logToServer("success", "server", "Saved configuration to secure server store.");
+  } catch (err: any) {
+    logToServer("error", "server", `Failed to persist config: ${err.message}`);
+    throw err;
+  }
+}
 
 // API endpoint to generate vocal speech patch
 app.post("/api/generate-patch", async (req, res) => {
@@ -319,8 +601,9 @@ app.post("/api/generate-patch", async (req, res) => {
     logToServer("info", "api", `Vocal Patch Generation Started. Voice preset: ${voicePreset || "Puck"}, text: "${textToSpeak.slice(0, 60)}${textToSpeak.length > 60 ? "..." : ""}" (${textToSpeak.length} chars). Has Style Guidelines: ${!!styleGuidelines}`);
 
     // Check if we should route to a custom local voice-cloning TTS service
-    const localTtsUrl = process.env.LOCAL_TTS_URL;
-    const localTtsToken = process.env.LOCAL_TTS_TOKEN;
+    const ttsCfg = getTTSConfig();
+    const localTtsUrl = ttsCfg.localTtsUrl;
+    const localTtsToken = ttsCfg.localTtsToken;
     const isClonedRequest = voicePreset === "cloned" || (referenceAudio && mimeType);
 
     if (isClonedRequest && localTtsUrl) {
@@ -860,6 +1143,439 @@ function saveWordPressConfig(config: WordPressConfig) {
     throw err;
   }
 }
+
+// Secure server-side routes for custom TTS settings
+app.get("/api/tts/settings", (req, res) => {
+  try {
+    const config = getTTSConfig();
+    const maskedToken = config.localTtsToken 
+      ? (config.localTtsToken.length > 8 
+          ? `${config.localTtsToken.slice(0, 4)}...${config.localTtsToken.slice(-4)}` 
+          : "••••••••") 
+      : "";
+    return res.json({
+      localTtsUrl: config.localTtsUrl,
+      localTtsToken: maskedToken,
+      hasToken: config.localTtsToken.length > 0
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Failed to fetch TTS settings: ${err.message}` });
+  }
+});
+
+app.post("/api/tts/settings", (req, res) => {
+  try {
+    const { localTtsUrl, localTtsToken } = req.body;
+
+    const currentConfig = getTTSConfig();
+    let finalToken = currentConfig.localTtsToken;
+
+    // Only update the stored token if it's not empty and not a masked value
+    if (localTtsToken && localTtsToken.trim() !== "" && !localTtsToken.includes("•") && !localTtsToken.includes("...")) {
+      finalToken = localTtsToken.trim();
+    } else if (localTtsToken === "") {
+      finalToken = "";
+    }
+
+    const newConfig = {
+      localTtsUrl: (localTtsUrl || "").trim(),
+      localTtsToken: finalToken,
+      geminiApiKey: currentConfig.geminiApiKey
+    };
+
+    saveTTSConfig(newConfig);
+
+    return res.json({
+      success: true,
+      message: "TTS configuration saved securely on server.",
+      localTtsUrl: newConfig.localTtsUrl,
+      hasToken: newConfig.localTtsToken.length > 0
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Failed to save TTS configuration: ${err.message}` });
+  }
+});
+
+app.post("/api/tts/test", async (req, res) => {
+  try {
+    const { localTtsUrl: paramUrl, localTtsToken: paramToken } = req.body;
+    const config = getTTSConfig();
+
+    const localTtsUrl = (paramUrl && paramUrl.trim() !== "") ? paramUrl : config.localTtsUrl;
+    let localTtsToken = config.localTtsToken;
+    if (paramToken && paramToken.trim() !== "" && !paramToken.includes("•") && !paramToken.includes("...")) {
+      localTtsToken = paramToken.trim();
+    } else if (paramToken === "") {
+      localTtsToken = "";
+    }
+
+    if (!localTtsUrl) {
+      return res.status(400).json({ error: "TTS URL is not configured. Please specify a URL." });
+    }
+
+    logToServer("info", "api", `Testing connection to local custom TTS server: ${localTtsUrl}`);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+
+    try {
+      const response = await fetch(localTtsUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": localTtsToken ? `Bearer ${localTtsToken}` : ""
+        },
+        body: JSON.stringify({
+          textToSpeak: "Test connection",
+          voicePreset: "cloned",
+          styleGuidelines: "Clear"
+        }),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      logToServer("success", "api", `TTS test connection completed. HTTP Status: ${response.status}`);
+      return res.json({
+        success: true,
+        status: response.status,
+        message: `Successfully contacted custom TTS server! Status code: ${response.status}.`
+      });
+    } catch (fetchErr: any) {
+      clearTimeout(timeoutId);
+      
+      // Fallback to simpler request or just warn
+      logToServer("warn", "api", `TTS POST failed, attempting simpler GET healthcheck...`);
+      
+      const getController = new AbortController();
+      const getTimeout = setTimeout(() => getController.abort(), 4000);
+      
+      const response = await fetch(localTtsUrl, {
+        method: "GET",
+        signal: getController.signal
+      });
+      
+      clearTimeout(getTimeout);
+      logToServer("success", "api", `TTS GET test connection completed. HTTP Status: ${response.status}`);
+      return res.json({
+        success: true,
+        status: response.status,
+        message: `Successfully connected to TTS server via fallback check. Status code: ${response.status}.`
+      });
+    }
+  } catch (err: any) {
+    logToServer("error", "api", `TTS test connection crashed: ${err.message}`);
+    return res.status(500).json({
+      error: `Connection to custom TTS failed: ${err.message}. Please check if the service is running and accessible.`
+    });
+  }
+});
+
+// Secure server-side routes for custom Gemini API Key
+app.get("/api/gemini/settings", (req, res) => {
+  try {
+    const config = getTTSConfig();
+    const key = config.geminiApiKey || "";
+    const maskedKey = key 
+      ? (key.length > 8 
+          ? `${key.slice(0, 4)}...${key.slice(-4)}` 
+          : "••••••••") 
+      : "";
+    return res.json({
+      geminiApiKey: maskedKey,
+      hasKey: key.length > 0
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Failed to fetch Gemini settings: ${err.message}` });
+  }
+});
+
+app.post("/api/gemini/settings", (req, res) => {
+  try {
+    const { geminiApiKey } = req.body;
+
+    const currentConfig = getTTSConfig();
+    let finalKey = currentConfig.geminiApiKey || "";
+
+    // Only update the stored key if it's not empty and not a masked value
+    if (geminiApiKey && geminiApiKey.trim() !== "" && !geminiApiKey.includes("•") && !geminiApiKey.includes("...")) {
+      finalKey = geminiApiKey.trim();
+    } else if (geminiApiKey === "") {
+      finalKey = "";
+    }
+
+    const newConfig = {
+      localTtsUrl: currentConfig.localTtsUrl,
+      localTtsToken: currentConfig.localTtsToken,
+      geminiApiKey: finalKey
+    };
+
+    saveTTSConfig(newConfig);
+
+    return res.json({
+      success: true,
+      message: "Gemini API key saved securely on server.",
+      hasKey: newConfig.geminiApiKey.length > 0
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Failed to save Gemini API key: ${err.message}` });
+  }
+});
+
+app.post("/api/gemini/test", async (req, res) => {
+  try {
+    const { geminiApiKey: paramKey } = req.body;
+    const config = getTTSConfig();
+
+    let geminiApiKey = (paramKey && paramKey.trim() !== "") ? paramKey.trim() : config.geminiApiKey;
+    if (geminiApiKey && (geminiApiKey.includes("•") || geminiApiKey.includes("..."))) {
+      geminiApiKey = config.geminiApiKey;
+    }
+
+    if (!geminiApiKey) {
+      geminiApiKey = process.env.GEMINI_API_KEY || "";
+    }
+
+    if (!geminiApiKey || geminiApiKey === "MY_GEMINI_API_KEY") {
+      return res.status(400).json({ error: "Gemini API key is not configured. Please enter a valid key." });
+    }
+
+    logToServer("info", "api", "Testing custom Gemini API key connection...");
+
+    const tempAi = new GoogleGenAI({
+      apiKey: geminiApiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build-test',
+        }
+      }
+    });
+
+    const response = await tempAi.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: "Respond with exactly: 'Connected'"
+    });
+
+    const text = response.text || "";
+    logToServer("success", "api", "Gemini API verification call succeeded!");
+    return res.json({
+      success: true,
+      message: `Gemini API key successfully verified! Model response: "${text.trim()}"`
+    });
+  } catch (err: any) {
+    logToServer("error", "api", `Gemini API connection verification failed: ${err.message}`);
+    return res.status(500).json({
+      error: `Gemini API authentication failed: ${err.message}`
+    });
+  }
+});
+
+// Secure server-side routes for HandAISpoke Local API & STT Settings
+app.get("/api/handaispoke/settings", (req, res) => {
+  try {
+    const config = getTTSConfig();
+    const token = config.handaiSpokeToken || "";
+    const maskedToken = token
+      ? (token.length > 8
+          ? `${token.slice(0, 4)}...${token.slice(-4)}`
+          : "••••••••")
+      : "";
+    return res.json({
+      sttEngine: config.sttEngine || "gemini",
+      handaiSpokeUrl: config.handaiSpokeUrl || "https://handaispokeapi.thehandaiman.com",
+      handaiSpokeToken: maskedToken,
+      hasToken: token.length > 0
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Failed to fetch HandAISpoke settings: ${err.message}` });
+  }
+});
+
+app.post("/api/handaispoke/settings", (req, res) => {
+  try {
+    const { sttEngine, handaiSpokeUrl, handaiSpokeToken } = req.body;
+
+    const currentConfig = getTTSConfig();
+    let finalToken = currentConfig.handaiSpokeToken || "";
+
+    // Only update the stored token if it's not empty and not a masked value
+    if (handaiSpokeToken && handaiSpokeToken.trim() !== "" && !handaiSpokeToken.includes("•") && !handaiSpokeToken.includes("...")) {
+      finalToken = handaiSpokeToken.trim();
+    } else if (handaiSpokeToken === "") {
+      finalToken = "";
+    }
+
+    const newConfig = {
+      ...currentConfig,
+      sttEngine: sttEngine || currentConfig.sttEngine || "gemini",
+      handaiSpokeUrl: handaiSpokeUrl !== undefined ? (handaiSpokeUrl || "").trim() : (currentConfig.handaiSpokeUrl || "https://handaispokeapi.thehandaiman.com"),
+      handaiSpokeToken: finalToken
+    };
+
+    saveTTSConfig(newConfig);
+
+    return res.json({
+      success: true,
+      message: "HandAISpoke settings saved securely on server.",
+      sttEngine: newConfig.sttEngine,
+      handaiSpokeUrl: newConfig.handaiSpokeUrl,
+      hasToken: newConfig.handaiSpokeToken.length > 0
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Failed to save HandAISpoke settings: ${err.message}` });
+  }
+});
+
+app.post("/api/handaispoke/test", async (req, res) => {
+  try {
+    const { handaiSpokeUrl: paramUrl, handaiSpokeToken: paramToken } = req.body;
+    const config = getTTSConfig();
+
+    const handaiSpokeUrl = (paramUrl && paramUrl.trim() !== "") ? paramUrl.trim() : (config.handaiSpokeUrl || "https://handaispokeapi.thehandaiman.com");
+    let handaiSpokeToken = config.handaiSpokeToken || "";
+    if (paramToken && paramToken.trim() !== "" && !paramToken.includes("•") && !paramToken.includes("...")) {
+      handaiSpokeToken = paramToken.trim();
+    }
+
+    if (!handaiSpokeUrl) {
+      return res.status(400).json({ error: "HandAISpoke API URL is not configured." });
+    }
+
+    logToServer("info", "api", `Testing connection to HandAISpoke Bridge at: ${handaiSpokeUrl}...`);
+
+    const response = await fetch(`${handaiSpokeUrl}/api/ai-studio-bridge/status`, {
+      method: "GET",
+      headers: {
+        "X-HandAISpoke-Bridge-Token": handaiSpokeToken
+      }
+    });
+
+    if (response.status === 401) {
+      return res.status(401).json({ error: "Unauthorized: HandAISpoke Bridge Token is invalid or rejected by the local bridge." });
+    }
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return res.status(response.status).json({ error: `Bridge returned HTTP ${response.status}: ${errText.slice(0, 150)}` });
+    }
+
+    const data = await response.json();
+    return res.json({
+      success: true,
+      message: `Successfully connected to HandAISpoke local bridge!`,
+      details: data
+    });
+  } catch (err: any) {
+    logToServer("error", "api", `HandAISpoke Bridge test connection failed: ${err.message}`);
+    return res.status(500).json({
+      error: `Failed to reach HandAISpoke Bridge: ${err.message}. Please ensure the bridge is running and your Cloudflare tunnel is active.`
+    });
+  }
+});
+
+app.post("/api/handaispoke/test-whisperx", async (req, res) => {
+  try {
+    const { handaiSpokeUrl: paramUrl, handaiSpokeToken: paramToken } = req.body;
+    const config = getTTSConfig();
+
+    const handaiSpokeUrl = (paramUrl && paramUrl.trim() !== "") ? paramUrl.trim() : (config.handaiSpokeUrl || "https://handaispokeapi.thehandaiman.com");
+    let handaiSpokeToken = config.handaiSpokeToken || "";
+    if (paramToken && paramToken.trim() !== "" && !paramToken.includes("•") && !paramToken.includes("...")) {
+      handaiSpokeToken = paramToken.trim();
+    }
+
+    if (!handaiSpokeUrl) {
+      return res.status(400).json({ error: "HandAISpoke API URL is not configured." });
+    }
+
+    logToServer("info", "api", `Testing WhisperX STT Capabilities at: ${handaiSpokeUrl}...`);
+
+    // Programmatically construct a perfectly valid tiny silent mono PCM WAV file (1 second, 8000Hz, 8-bit unsigned PCM)
+    const wavHeader = Buffer.alloc(44);
+    wavHeader.write("RIFF", 0);
+    wavHeader.writeUInt32LE(36 + 8000, 4);
+    wavHeader.write("WAVE", 8);
+    wavHeader.write("fmt ", 12);
+    wavHeader.writeUInt32LE(16, 16);
+    wavHeader.writeUInt16LE(1, 20);
+    wavHeader.writeUInt16LE(1, 22);
+    wavHeader.writeUInt32LE(8000, 24);
+    wavHeader.writeUInt32LE(8000, 28);
+    wavHeader.writeUInt16LE(1, 32);
+    wavHeader.writeUInt16LE(8, 34);
+    wavHeader.write("data", 36);
+    wavHeader.writeUInt32LE(8000, 40);
+
+    const silence = Buffer.alloc(8000, 128); // 128 is mid-range silence for 8-bit unsigned PCM
+    const dummyWav = Buffer.concat([wavHeader, silence]);
+
+    const formData = new FormData();
+    const audioBlob = new Blob([dummyWav], { type: "audio/wav" });
+    formData.append("file", audioBlob, "test_chunk.wav");
+    formData.append("model", "whisperx");
+    formData.append("response_format", "verbose_json");
+    formData.append("timestamp_granularities[]", "segment");
+
+    const endpointUrl = `${handaiSpokeUrl}/v1/audio/transcriptions`;
+    logToServer("info", "api", `Posting diagnostic test to ${endpointUrl}...`);
+
+    const response = await fetch(endpointUrl, {
+      method: "POST",
+      headers: {
+        "X-HandAISpoke-Bridge-Token": handaiSpokeToken
+      },
+      body: formData
+    });
+
+    if (response.status === 401) {
+      return res.status(401).json({ error: "Unauthorized: HandAISpoke Bridge Token is invalid or rejected." });
+    }
+
+    const resContentType = response.headers.get("content-type") || "";
+    let resBodyText = "";
+    try {
+      resBodyText = await response.text();
+    } catch (_) {}
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: `WhisperX API returned HTTP error ${response.status}. This indicates the route or container might be failing or WhisperX is not properly loaded.`,
+        details: {
+          statusCode: response.status,
+          headers: Object.fromEntries(response.headers.entries()),
+          body: resBodyText.slice(0, 500)
+        }
+      });
+    }
+
+    let parsedResult: any = null;
+    if (resContentType.includes("application/json")) {
+      try {
+        parsedResult = JSON.parse(resBodyText);
+      } catch (_) {
+        parsedResult = { rawText: resBodyText };
+      }
+    } else {
+      parsedResult = { rawText: resBodyText };
+    }
+
+    return res.json({
+      success: true,
+      message: "WhisperX transcription endpoint responded successfully!",
+      details: parsedResult
+    });
+
+  } catch (err: any) {
+    logToServer("error", "api", `WhisperX diagnostic check failed: ${err.message}`);
+    return res.status(500).json({
+      error: `Could not contact WhisperX endpoint: ${err.message}. Ensure your local speech container is listening, running, and accessible via the tunnel.`,
+      details: {
+        exceptionMessage: err.message,
+        stack: err.stack ? err.stack.split("\n").slice(0, 3) : undefined
+      }
+    });
+  }
+});
 
 // 1. GET Settings endpoint: Hides/masks the actual application password from browser
 app.get("/api/wordpress/settings", (req, res) => {

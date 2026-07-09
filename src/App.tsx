@@ -34,6 +34,7 @@ import VolumeNormalization from "./components/VolumeNormalization";
 import NoiseStudio from "./components/NoiseStudio";
 import DescriptiveEditing from "./components/DescriptiveEditing";
 import DistributionStudio from "./components/DistributionStudio";
+import SettingsStudio from "./components/SettingsStudio";
 
 interface FileState {
   name: string;
@@ -49,7 +50,7 @@ export default function App() {
   const [stitchedBuffer, setStitchedBuffer] = useState<AudioBuffer | null>(null);
   const [segments, setSegments] = useState<AudioSegment[]>([]);
 
-  const [workspaceTab, setWorkspaceTab] = useState<"editor" | "diagnostics" | "tts" | "normalization" | "noise" | "descriptive" | "distribution">("editor");
+  const [workspaceTab, setWorkspaceTab] = useState<"editor" | "diagnostics" | "tts" | "normalization" | "noise" | "descriptive" | "distribution" | "settings">("editor");
   const [showWorkspaceGuide, setShowWorkspaceGuide] = useState(true);
   const [silenceThreshold, setSilenceThreshold] = useState(-40);
   const [maxSilenceDuration, setMaxSilenceDuration] = useState(0.3);
@@ -239,6 +240,24 @@ export default function App() {
       window.removeEventListener("error", handleWindowError);
     };
   }, []);
+
+  const [sttEngine, setSttEngine] = useState<"gemini" | "handaispoke">("handaispoke");
+
+  // Load HandAISpoke settings periodically/when switching tabs
+  useEffect(() => {
+    const fetchSttEngine = async () => {
+      try {
+        const res = await fetch("/api/handaispoke/settings");
+        if (res.ok) {
+          const data = await res.json();
+          setSttEngine(data.sttEngine || "handaispoke");
+        }
+      } catch (err) {
+        console.error("Failed to load STT engine settings in main app:", err);
+      }
+    };
+    fetchSttEngine();
+  }, [workspaceTab]);
 
   // Fetch Server Logs function
   const fetchServerLogs = async () => {
@@ -615,6 +634,7 @@ export default function App() {
       console.log(`Audio split into ${totalChunks} chunks:`, splits);
 
       const allRawKeeps: any[] = [];
+      const allRawDiscards: any[] = [];
       const tempCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
 
       // 2. Process each chunk sequentially
@@ -740,6 +760,30 @@ export default function App() {
         } else {
           console.warn(`Segment ${i + 1} returned no keep zones.`);
         }
+
+        if (result && Array.isArray(result.discards)) {
+          const chunkDiscards = result.discards.map((d: any) => {
+            const rawStart = parseFloat(d.start);
+            const rawEnd = parseFloat(d.end);
+
+            let relativeStart = Math.max(0, Math.min(chunkDuration, isNaN(rawStart) ? 0 : rawStart));
+            let relativeEnd = Math.max(0, Math.min(chunkDuration, isNaN(rawEnd) ? chunkDuration : rawEnd));
+
+            if (relativeStart > relativeEnd) {
+              const temp = relativeStart;
+              relativeStart = relativeEnd;
+              relativeEnd = temp;
+            }
+
+            return {
+              start: start + relativeStart,
+              end: start + relativeEnd,
+              transcript: d.transcript || "[Discarded Segment]",
+            };
+          });
+
+          allRawDiscards.push(...chunkDiscards);
+        }
       }
 
       if (abortAnalysisRef.current) {
@@ -794,11 +838,18 @@ export default function App() {
 
           // Only insert a discard if there is a gap greater than 0.3 seconds
           if (kSeg.start > lastPos + 0.3) {
+            const overlappingDiscards = allRawDiscards.filter((d) => {
+              return d.end > lastPos + 0.05 && d.start < kSeg.start - 0.05;
+            });
+            const gapTranscript = overlappingDiscards.length > 0
+              ? overlappingDiscards.map(d => d.transcript).join(" ")
+              : "[Mistake, repetition, or silent pause edited out]";
+
             completeTimeline.push({
               id: `discard_${idx}_${Date.now()}`,
               start: lastPos,
               end: kSeg.start,
-              transcript: "[Mistake, repetition, or silent pause edited out]",
+              transcript: gapTranscript,
               keep: false,
             });
           }
@@ -810,11 +861,18 @@ export default function App() {
         });
 
         if (audioBuffer.duration > lastPos + 0.3) {
+          const overlappingDiscards = allRawDiscards.filter((d) => {
+            return d.end > lastPos + 0.05 && d.start < audioBuffer.duration - 0.05;
+          });
+          const gapTranscript = overlappingDiscards.length > 0
+            ? overlappingDiscards.map(d => d.transcript).join(" ")
+            : "[Room tone or tail silence cut]";
+
           completeTimeline.push({
             id: `discard_end_${Date.now()}`,
             start: lastPos,
             end: audioBuffer.duration,
-            transcript: "[Room tone or tail silence cut]",
+            transcript: gapTranscript,
             keep: false,
           });
         }
@@ -888,11 +946,18 @@ export default function App() {
           }
 
           if (kSeg.start > rangeLastPos + 0.3) {
+            const overlappingDiscards = allRawDiscards.filter((d) => {
+              return d.end > rangeLastPos + 0.05 && d.start < kSeg.start - 0.05;
+            });
+            const gapTranscript = overlappingDiscards.length > 0
+              ? overlappingDiscards.map(d => d.transcript).join(" ")
+              : "[Mistake, repetition, or silent pause edited out]";
+
             localRangeTimeline.push({
               id: `discard_range_${idx}_${Date.now()}`,
               start: rangeLastPos,
               end: kSeg.start,
-              transcript: "[Mistake, repetition, or silent pause edited out]",
+              transcript: gapTranscript,
               keep: false,
             });
           }
@@ -904,11 +969,18 @@ export default function App() {
         });
 
         if (endOffset > rangeLastPos + 0.3) {
+          const overlappingDiscards = allRawDiscards.filter((d) => {
+            return d.end > rangeLastPos + 0.05 && d.start < endOffset - 0.05;
+          });
+          const gapTranscript = overlappingDiscards.length > 0
+            ? overlappingDiscards.map(d => d.transcript).join(" ")
+            : "[Edited out]";
+
           localRangeTimeline.push({
             id: `discard_range_end_${Date.now()}`,
             start: rangeLastPos,
             end: endOffset,
-            transcript: "[Edited out]",
+            transcript: gapTranscript,
             keep: false,
           });
         }
@@ -1496,6 +1568,21 @@ export default function App() {
               <span>Distribution</span>
             </button>
             <button
+              id="workspace-tab-settings"
+              onClick={() => {
+                setWorkspaceTab("settings");
+                addLog("info", "action", "Opened Systems Settings Studio");
+              }}
+              className={`flex items-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                workspaceTab === "settings"
+                  ? "bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/10 font-bold"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Settings className="w-4 h-4" />
+              <span>Settings</span>
+            </button>
+            <button
               id="workspace-tab-diagnostics"
               onClick={() => {
                 setWorkspaceTab("diagnostics");
@@ -1647,6 +1734,13 @@ export default function App() {
           />
         </div>
 
+        {/* Settings Tab Content */}
+        <div className={workspaceTab === "settings" ? "contents" : "hidden"} id="workspace-content-settings">
+          <SettingsStudio
+            addLog={addLog}
+          />
+        </div>
+
         {/* Speech Repair Tab Content */}
         <div className={workspaceTab === "editor" ? "contents" : "hidden"} id="workspace-content-editor">
           {!originalFile ? (
@@ -1711,14 +1805,14 @@ export default function App() {
                   </div>
                   <textarea
                     id="reference-script-area"
-                    placeholder="Paste or type the intended text/script here. Gemini will use this to align the audio perfectly and precisely edit out errors, repetitions, or stutters..."
+                    placeholder={`Paste or type the intended text/script here. ${sttEngine === "handaispoke" ? "HandAISpoke" : "Gemini"} will use this to align the audio perfectly and precisely edit out errors, repetitions, or stutters...`}
                     value={referenceScript}
                     onChange={(e) => setReferenceScript(e.target.value)}
                     rows={3}
                     className="w-full bg-slate-900/50 border border-slate-800 focus:border-emerald-500/50 rounded-lg p-2.5 text-xs text-slate-300 placeholder-slate-600 focus:outline-none transition-colors resize-y font-sans leading-relaxed"
                   />
                   <div className="flex justify-between items-center mt-1.5 text-[10px] text-slate-500 font-mono">
-                    <span>Helps Gemini match words & prevent cutoffs</span>
+                    <span>Helps {sttEngine === "handaispoke" ? "HandAISpoke" : "Gemini"} match words & prevent cutoffs</span>
                     <span>{referenceScript.length} chars</span>
                   </div>
                 </div>
@@ -1817,10 +1911,10 @@ export default function App() {
                       Read the script, purposely reading the duplicate parts.
                     </li>
                     <li>
-                      Stop, and click <strong className="text-emerald-400">Analyze with Gemini AI</strong>.
+                      Stop, and click <strong className="text-emerald-400">Analyze with {sttEngine === "handaispoke" ? "HandAISpoke" : "Gemini"} AI</strong>.
                     </li>
                     <li>
-                      Gemini will automatically slice the vocal track, cross out the mistakes, and stitch the clean takes into a perfect seamless download!
+                      {sttEngine === "handaispoke" ? "HandAISpoke" : "Gemini"} will automatically slice the vocal track, cross out the mistakes, and stitch the clean takes into a perfect seamless download!
                     </li>
                   </ol>
                 </div>
@@ -1920,7 +2014,7 @@ export default function App() {
                             id="analyze-selection-btn"
                             onClick={() => triggerAnalyze(selectionStart, selectionEnd)}
                             className="flex items-center gap-1.5 px-4 py-2 bg-sky-500 hover:bg-sky-400 active:bg-sky-600 text-slate-950 font-bold rounded-lg text-xs tracking-wide shadow-md shadow-sky-500/10 cursor-pointer animate-bounce"
-                            title="Retry Gemini analysis only on highlighted timeline section"
+                            title={`Retry ${sttEngine === "handaispoke" ? "HandAISpoke" : "Gemini"} analysis only on highlighted timeline section`}
                           >
                             <Sparkles className="w-3.5 h-3.5 fill-slate-950" />
                             <span>Retry Selection ({Math.round(selectionStart)}s - {Math.round(selectionEnd)}s)</span>
@@ -1943,7 +2037,7 @@ export default function App() {
                           className="flex items-center gap-2 px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-slate-950 font-bold rounded-lg text-xs tracking-wide shadow-md shadow-emerald-500/10 cursor-pointer"
                         >
                           <Sparkles className="w-4 h-4 fill-slate-950" />
-                          <span>Analyze & Edit with Gemini AI</span>
+                          <span>Analyze & Edit with {sttEngine === "handaispoke" ? "HandAISpoke" : "Gemini AI"}</span>
                         </button>
                       )}
                     </div>
@@ -1953,7 +2047,7 @@ export default function App() {
                   <div className="border-t border-slate-800/60 pt-4 mt-3">
                     <div className="flex items-center gap-1.5 mb-3 text-xs font-semibold text-slate-300">
                       <Settings className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Advanced Gemini Processing Options</span>
+                      <span>Advanced Processing Options ({sttEngine === "handaispoke" ? "HandAISpoke" : "Gemini"})</span>
                     </div>
 
                     <div className="grid grid-cols-2 gap-3 mb-3">
@@ -2026,7 +2120,11 @@ export default function App() {
                                 </span>
                               </div>
 
-                              {estimatedCount > 5 && (
+                              {sttEngine === "handaispoke" ? (
+                                <div className="mt-2 p-2 bg-emerald-950/20 border border-emerald-900/30 rounded text-[10px] text-emerald-400 leading-normal">
+                                  ⚡ <strong>Local Engine Active:</strong> Your local HandAISpoke engine is active and unlimited. Speech-to-text transcription and editing is handled securely without cloud audio uploads.
+                                </div>
+                              ) : estimatedCount > 5 && (
                                 <div className="mt-2 p-2 bg-amber-950/20 border border-amber-900/30 rounded text-[10px] text-amber-400 leading-normal">
                                   ⚠️ <strong>Quota Limit Warning:</strong> Your Gemini API free tier key allows up to 20 daily requests. Processing with the current settings will make <strong>{estimatedCount} API requests</strong>. Choose <strong>"300s"</strong> or <strong>"Whole Audio"</strong> to avoid exhausting your quota!
                                 </div>
@@ -2071,7 +2169,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Loader Panel during Gemini analysis */}
+              {/* Loader Panel during speech analysis */}
               {isAnalyzing && (
                 <div className="p-8 bg-slate-900/60 rounded-2xl border border-slate-800 flex flex-col items-center justify-center text-center gap-4">
                   <div className="relative">
@@ -2080,11 +2178,15 @@ export default function App() {
                   </div>
                   <div className="flex flex-col gap-1">
                     <span className="text-xs font-mono text-emerald-400 uppercase tracking-widest animate-pulse">
-                      Processing Spoken Word
+                      {sttEngine === "handaispoke" ? "HandAISpoke Processing" : "Processing Spoken Word"}
                     </span>
                     <p className="text-sm font-semibold text-slate-200">{analysisStep}</p>
                     <span className="text-[10px] text-slate-500 max-w-xs mt-1 leading-relaxed">
-                      Gemini listens directly to the recording, transcribes takes, and locates the exact seconds containing mistakes.
+                      {sttEngine === "handaispoke" ? (
+                        "HandAISpoke transcribes the recording locally using Faster-Whisper/WhisperX and performs alignment to coordinate precise editing points."
+                      ) : (
+                        "Gemini listens directly to the recording, transcribes takes, and locates the exact seconds containing mistakes."
+                      )}
                     </span>
                   </div>
                   <button
